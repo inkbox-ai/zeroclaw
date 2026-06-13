@@ -71,6 +71,7 @@ cli-skills-audit-about = Audit a skill source directory or installed skill name
 cli-skills-install-about = Install a new skill from a URL or local path
 cli-skills-remove-about = Remove an installed skill
 cli-skills-test-about = Run TEST.sh validation for a skill (or all skills)
+cli-skills-review-summary = { "  " }💾 Skill review: {$summary}
 cli-skills-install-start = Installing skill from: {$source}
 cli-skills-install-resolving-registry = { "  " }Resolving '{$source}' from skills registry...
 cli-skills-install-installed-audited = { "  " }{$status} Skill installed and audited: {$path} ({$files} files scanned)
