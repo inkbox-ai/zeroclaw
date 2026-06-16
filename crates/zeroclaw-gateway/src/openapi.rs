@@ -61,6 +61,7 @@ pub async fn handle_openapi_json() -> Response {
 /// update fails the build.
 #[cfg(feature = "schema-export")]
 pub fn build_spec() -> serde_json::Value {
+    use crate::a2a::{JsonRpcRequest, OutTask};
     use crate::api_config::{
         DriftEntry, DriftResponse, InitQuery, InitResponse, ListResponse, MigrateResponse, PatchOp,
         PatchResponse, PropPutBody, PropResponse, ReloadStatusResponse, SecretResponse,
@@ -87,6 +88,8 @@ pub fn build_spec() -> serde_json::Value {
             "DriftResponse":    schema_value::<DriftResponse>(),
             "ReloadStatusResponse": schema_value::<ReloadStatusResponse>(),
             "Config":           schema_value::<zeroclaw_config::schema::Config>(),
+            "A2aTaskRequest":   schema_value::<JsonRpcRequest>(),
+            "A2aTask":          schema_value::<OutTask>(),
         },
         "securitySchemes": {
             "bearerAuth": {
@@ -283,6 +286,33 @@ pub fn build_spec() -> serde_json::Value {
                     }
                 }
             }
+        },
+        "/a2a/{alias}": {
+            "post": {
+                "tags": ["a2a"],
+                "summary": "Send a task to a published A2A agent",
+                "description": "JSON-RPC 2.0 endpoint for one published agent. Only `message/send` is handled: the message `parts` of kind `text` are joined into the agent prompt, the agent runs one turn, and a completed A2A `Task` carrying the reply as an artifact is returned. Unpublished or disabled aliases return 404. The server must be enabled (`[a2a.server] enabled`) and the alias published (`[agents.<alias>.a2a] published`).",
+                "parameters": [{
+                    "name": "alias",
+                    "in": "path",
+                    "required": true,
+                    "schema": { "type": "string" },
+                    "description": "Published agent alias, as listed in the discovery catalog."
+                }],
+                "requestBody": {
+                    "required": true,
+                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/A2aTaskRequest" } } }
+                },
+                "responses": {
+                    "200": {
+                        "description": "JSON-RPC response. On success `result` is a completed A2A Task; on a JSON-RPC error (unknown method, bad params) `error` carries the code and message.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/A2aTask" } } }
+                    },
+                    "404": {
+                        "description": "Server disabled, alias unpublished, or alias unknown."
+                    }
+                }
+            }
         }
     });
 
@@ -424,6 +454,16 @@ mod tests {
         assert!(paths.get("/api/config/migrate").is_some());
         assert!(paths.get("/api/config/drift").is_some());
         assert!(paths.get("/api/config/reload-status").is_some());
+        assert!(paths.get("/a2a/{alias}").is_some());
+    }
+
+    #[cfg(feature = "schema-export")]
+    #[test]
+    fn spec_registers_a2a_task_schemas() {
+        let spec = build_spec();
+        let schemas = spec.pointer("/components/schemas").unwrap();
+        assert!(schemas.get("A2aTaskRequest").is_some());
+        assert!(schemas.get("A2aTask").is_some());
     }
 
     #[cfg(feature = "schema-export")]

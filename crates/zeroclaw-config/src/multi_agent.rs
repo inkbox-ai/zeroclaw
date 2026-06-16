@@ -169,7 +169,7 @@ pub struct PeerGroupConfig {
 /// Wrapped under `[a2a.server]` (two-level) via [`A2aServerSection`] so the
 /// `a2a` table can grow sibling sub-tables later (e.g. client config) without
 /// a breaking move.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "a2a_server"]
 #[serde(default)]
@@ -177,46 +177,34 @@ pub struct A2aServerConfig {
     /// Master switch for the inbound A2A surface. Default `false`: no
     /// well-known route, no per-alias cards, no inbound endpoints.
     pub enabled: bool,
-    /// Bind address for the A2A server. Defaults to loopback; set a
-    /// non-loopback address only with deliberate network exposure.
-    pub bind: String,
-    /// Listen port for the A2A server.
-    pub port: u16,
+    /// Optional advertise-only host override for card endpoint URLs. The
+    /// routes always serve on the gateway's own listener; this only changes
+    /// the host printed in advertised endpoints when A2A is fronted at a
+    /// different address. `None` derives from the gateway host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bind: Option<String>,
+    /// Optional advertise-only port override, paired with `bind`. `None`
+    /// derives from the gateway port. Advertise-only: nothing binds here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
     /// Externally reachable base URL advertised in card endpoint fields
-    /// (e.g. `https://agents.example.com`). When empty, endpoints are
-    /// derived from `bind`/`port`. Set this behind a reverse proxy so
+    /// (e.g. `https://agents.example.com`). Highest precedence. When empty,
+    /// endpoints fall back to the `bind`/`port` override, then to the
+    /// gateway's own host and port. Set this behind a reverse proxy so
     /// advertised URLs match the public origin.
     pub public_base_url: String,
 }
 
-impl Default for A2aServerConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            bind: default_a2a_bind(),
-            port: default_a2a_port(),
-            public_base_url: String::new(),
-        }
-    }
-}
-
-fn default_a2a_bind() -> String {
-    "127.0.0.1".into()
-}
-
-fn default_a2a_port() -> u16 {
-    18800
-}
-
-/// `[a2a]` section wrapper. Holds the inbound `[a2a.server]` block. Kept as a
+/// `[a2a]` section wrapper. Kept as a
 /// dedicated wrapper so the `a2a` table can host sibling sub-tables (outbound
 /// client config, signing) in later slices without moving `server`.
 ///
 /// Server-level exposure gate for A2A agent discovery. Default-closed: the
 /// server serves nothing until `[a2a.server] enabled = true`, and even then
 /// only aliases that opt in via `[agents.<alias>.a2a] published = true`
-/// appear. Binds to localhost by default; public exposure is an explicit
-/// operator choice. See `crates/zeroclaw-gateway/src/a2a.rs`.
+/// appear. The discovery routes serve on the gateway's own listener; public
+/// exposure follows the gateway's bind posture. See
+/// `crates/zeroclaw-gateway/src/a2a.rs`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "a2a"]
@@ -439,11 +427,11 @@ output_modality = "voice"
     }
 
     #[test]
-    fn a2a_server_config_default_is_closed_and_loopback() {
+    fn a2a_server_config_default_is_closed_with_no_overrides() {
         let cfg = A2aServerConfig::default();
         assert!(!cfg.enabled);
-        assert_eq!(cfg.bind, "127.0.0.1");
-        assert_eq!(cfg.port, 18800);
+        assert!(cfg.bind.is_none());
+        assert!(cfg.port.is_none());
         assert!(cfg.public_base_url.is_empty());
     }
 
@@ -457,8 +445,8 @@ public_base_url = "https://agents.example.com"
 "#;
         let parsed: A2aServerConfig = toml::from_str(toml_input).unwrap();
         assert!(parsed.enabled);
-        assert_eq!(parsed.bind, "0.0.0.0");
-        assert_eq!(parsed.port, 9000);
+        assert_eq!(parsed.bind.as_deref(), Some("0.0.0.0"));
+        assert_eq!(parsed.port, Some(9000));
         assert_eq!(parsed.public_base_url, "https://agents.example.com");
     }
 

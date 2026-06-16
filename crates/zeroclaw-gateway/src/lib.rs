@@ -2214,7 +2214,7 @@ fn needs_quickstart_channel_reply() -> String {
 /// `agent_override` is the caller-requested agent alias (`/webhook?agent=`),
 /// already validated against `config.agents` by the handler. `None` keeps the
 /// legacy default pick (migration-synthesized "default", else first enabled).
-async fn run_gateway_chat_with_tools(
+pub(crate) async fn run_gateway_chat_with_tools(
     state: &AppState,
     message: &str,
     session_id: Option<&str>,
