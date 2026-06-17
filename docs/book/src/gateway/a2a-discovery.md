@@ -320,6 +320,35 @@ actually carries: it must live in one of the agent's skill bundles and its
 skill in a bundle the agent does not declare, is dropped silently rather than
 advertised.
 
+### What publishing actually exposes
+
+Read this before you publish. Once the server is enabled and an alias is
+published, `POST /a2a/{alias}` runs a full agent turn for that alias: it invokes
+the agent through the same path the chat surfaces use, with the agent's entire
+configured toolset (shell, file, browser, and whatever else that alias carries).
+
+That endpoint is not behind the gateway's bearer/pairing auth. Authentication in
+this gateway is enforced per handler, and the A2A task handler does not gate on a
+token, by design: cross-deployment interop only works if a peer can reach the
+endpoint without sharing your login. The practical consequence is direct:
+**anyone who can reach the gateway listener can invoke a published agent, tools
+and all, with no credential**, while neighboring endpoints like `/api/config`
+require a bearer token.
+
+This is a deliberate trade for frictionless agent-to-agent calls, not an
+oversight, but it means publishing is a real exposure decision. Before you flip
+the switches:
+
+- Scope the bind posture. Bind the gateway to a private interface, or sit it
+  behind a reverse proxy that enforces auth, rather than exposing the listener
+  directly to an untrusted network.
+- Publish only aliases whose full toolset you are willing to have invoked by any
+  reachable caller, and narrow `exposed_skills` to the minimum that interop
+  needs.
+- Treat a published alias as a remotely-invokable execution surface when you
+  decide which tools and skill bundles that alias carries.
+
+
 ## How several deployments connect
 
 Discovery composes across any number of deployments. Each deployment publishes
