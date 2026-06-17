@@ -157,7 +157,7 @@ pub fn build_catalog_card(config: &Config) -> AgentCard {
     for alias in &published {
         for mut skill in exposed_skills(config, alias) {
             skill.id = format!("{alias}/{}", skill.id);
-            skill.tags = vec![alias.clone()];
+            skill.tags.push(alias.clone());
             skills.push(skill);
         }
     }
@@ -595,11 +595,18 @@ mod tests {
         let ids: Vec<&str> = card.skills.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, vec!["widget"]);
         assert_eq!(card.skills[0].name, "Widget");
+        // Per-alias card tags carry the owning bundle.
+        assert_eq!(card.skills[0].tags, vec!["demo".to_string()]);
 
         let catalog = build_catalog_card(&config);
         assert_eq!(catalog.skills.len(), 1);
         assert_eq!(catalog.skills[0].id, "maker/widget");
-        assert_eq!(catalog.skills[0].tags, vec!["maker".to_string()]);
+        // The catalog appends the owning alias on top of the resolved bundle
+        // tag rather than replacing it, so both survive.
+        assert_eq!(
+            catalog.skills[0].tags,
+            vec!["demo".to_string(), "maker".to_string()]
+        );
     }
 
     #[test]
