@@ -525,6 +525,10 @@ async fn handle_alias_task(
 /// A2A discovery routes. The server-enabled gate is enforced per request (so a
 /// runtime config reload toggles it without a router rebuild); the routes are
 /// always mounted but answer 404 while disabled.
+///
+/// These are fast, read-only card lookups and belong under the standard
+/// gateway timeout. The synchronous task endpoint lives in
+/// [`a2a_task_route`] so it can opt into the long-running timeout.
 pub fn a2a_routes() -> Router<AppState> {
     Router::new()
         .route(CATALOG_CARD_PATH, get(handle_catalog_card))
@@ -533,7 +537,15 @@ pub fn a2a_routes() -> Router<AppState> {
             &format!("/a2a/{{alias}}{WELL_KNOWN_AGENT_CARD_PATH}"),
             get(handle_alias_card),
         )
-        .route("/a2a/{alias}", post(handle_alias_task))
+}
+
+/// The A2A `message/send` task endpoint. `handle_alias_task` runs a full agent
+/// turn inline through `run_gateway_chat_with_tools`, so this route must sit on
+/// the long-running timeout router (like manual cron triggers), not the 30s
+/// gateway-wide limit, or any non-trivial turn is cut off at
+/// `request_timeout_secs`.
+pub fn a2a_task_route() -> Router<AppState> {
+    Router::new().route("/a2a/{alias}", post(handle_alias_task))
 }
 
 #[cfg(test)]
