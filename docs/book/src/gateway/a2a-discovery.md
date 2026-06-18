@@ -348,7 +348,6 @@ the switches:
 - Treat a published alias as a remotely-invokable execution surface when you
   decide which tools and skill bundles that alias carries.
 
-
 ## How several deployments connect
 
 Discovery composes across any number of deployments. Each deployment publishes
