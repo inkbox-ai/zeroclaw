@@ -851,18 +851,18 @@ pub async fn run_realtime_bridge(
                             }
                         }
                         if closing {
-                            // Let the spoken goodbye land, then drop the carrier leg:
-                            // send the hangup frame AND explicitly close the socket so
-                            // Inkbox actually tears down the call (a bare drop doesn't).
+                            // Let the spoken goodbye land, then end the call. Inkbox
+                            // tears down the carrier leg on a `stop` event from the
+                            // client (it sets hangup_reason=local and fires
+                            // CLIENT_HANGUP); a `hangup` event is NOT handled server-
+                            // side, so that's why earlier attempts never hung up. Send
+                            // `stop`, then close the socket as a backstop.
                             tokio::time::sleep(Duration::from_secs(HANGUP_CLOSE_DELAY_SECS)).await;
-                            let mut hangup = json!({ "event": "hangup" });
+                            let mut stop = json!({ "event": "stop" });
                             if !hangup_reason.is_empty() {
-                                hangup["reason"] = json!(hangup_reason);
+                                stop["reason"] = json!(hangup_reason);
                             }
-                            if let Some(sid) = &stream_id {
-                                hangup["stream_id"] = json!(sid);
-                            }
-                            let _ = ink_tx.send(Message::Text(hangup.to_string().into())).await;
+                            let _ = ink_tx.send(Message::Text(stop.to_string().into())).await;
                             let _ = ink_tx.close().await;
                             break;
                         }
