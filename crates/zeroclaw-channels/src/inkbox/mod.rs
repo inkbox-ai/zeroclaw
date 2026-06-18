@@ -115,18 +115,22 @@ fn reconcile_routing(inkbox: &Arc<Inkbox>, handle: &str) -> Result<()> {
     }
     if let Some(phone) = identity.phone_number() {
         ensure("text.received", None, Some(phone.id), None)?;
-        // Auto-accept inbound calls and bridge their audio to our call-media WS.
+        // Route inbound calls through the incoming-call webhook (not auto_accept)
+        // so Inkbox hits `/incoming-call`, which answers with a call-media WS URL
+        // carrying `?call_id=`. That id is what lets the realtime bridge resolve
+        // the caller's contact card; auto_accept connects the WS without it.
         let call_ws = format!("wss://{public_host}/phone/media/ws");
+        let call_webhook = format!("https://{public_host}/incoming-call");
         inkbox
             .phone_numbers()
             .update(
                 &phone.id.to_string(),
-                Some(Some("auto_accept")),
+                Some(Some("webhook")),
                 Some(Some(call_ws.as_str())),
-                None,
+                Some(Some(call_webhook.as_str())),
                 None,
             )
-            .context("set Inkbox incoming-call WebSocket URL")?;
+            .context("set Inkbox incoming-call webhook + WebSocket URL")?;
     }
     if identity.imessage_enabled() {
         ensure("imessage.received", None, None, Some(identity.id()))?;
@@ -269,6 +273,25 @@ impl Channel for InkboxChannel {
             ),
         );
 
+        // Resolve the tunnel public host up front (blocking SDK on its own OS
+        // thread, per the nested-runtime constraint below) so the incoming-call
+        // webhook handler can build the call WS URL with `?call_id=`.
+        let public_host = {
+            let inkbox = self.inkbox.clone();
+            let handle = self.identity.clone();
+            let (host_tx, host_rx) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                let host = inkbox
+                    .get_identity(&handle)
+                    .ok()
+                    .and_then(|id| id.tunnel().map(|t| t.public_host))
+                    .filter(|h| !h.is_empty())
+                    .unwrap_or_default();
+                let _ = host_tx.send(host);
+            });
+            host_rx.await.unwrap_or_default()
+        };
+
         // Loopback server that receives the tunnel-forwarded webhooks + call WS.
         let app = inbound::router(inbound::AppState {
             tx,
@@ -277,6 +300,7 @@ impl Channel for InkboxChannel {
             realtime: self.realtime.clone(),
             inkbox: self.inkbox.clone(),
             identity: self.identity.clone(),
+            public_host,
         });
         let server = tokio::spawn(async move { axum::serve(listener, app).await });
 
