@@ -71,6 +71,9 @@ pub async fn ws_handler(
         // Outbound calls carry a `context_token` written by `inkbox_place_call`;
         // it resolves the purpose/opening to inject. Inbound calls have none.
         let meta = super::realtime::load_call_meta(params.get("context_token").map(String::as_str));
+        // Inbound calls arrive with `?call_id=` (Inkbox stamps it onto the call
+        // WS URL); the bridge uses it to resolve the caller's contact + email.
+        let call_id = params.get("call_id").cloned().unwrap_or_default();
         // Pre-flight the OpenAI connection so `realtime_fallback` can drop to
         // Inkbox STT/TTS when the model is unreachable, instead of a dead call.
         match super::realtime::connect_openai(&rt).await {
@@ -82,7 +85,7 @@ pub async fn ws_handler(
                 let mut resp = ws
                     .on_upgrade(move |socket| {
                         super::realtime::run_realtime_bridge(
-                            socket, openai, rt, meta, tx, alias, client, identity,
+                            socket, openai, rt, meta, tx, alias, client, identity, call_id,
                         )
                     })
                     .into_response();

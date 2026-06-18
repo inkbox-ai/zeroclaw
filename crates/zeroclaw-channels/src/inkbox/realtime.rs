@@ -61,6 +61,10 @@ pub struct CallMeta {
     pub call_id: String,
     pub direction: String,
     pub contact_name: Option<String>,
+    /// The caller's full Inkbox contact card (every populated field), rendered
+    /// for the model — so the agent can act on "send me an email" / "text my
+    /// other number" without asking who they are or how to reach them.
+    pub contact_card: Option<String>,
     /// Outbound-call purpose (why we're calling), when known.
     pub purpose: Option<String>,
     /// Outbound opening line to say verbatim, when set.
@@ -76,6 +80,10 @@ const OPENAI_REALTIME_URL: &str = "wss://api.openai.com/v1/realtime";
 const INPUT_TRANSCRIPTION_MODEL: &str = "gpt-4o-mini-transcribe";
 const CONSULT_TIMEOUT_SECS: u64 = 60;
 const HANGUP_CONFIRM_WINDOW_SECS: u64 = 60;
+/// After the confirmed `hang_up_call`, hold the carrier leg open briefly so the
+/// already-forwarded goodbye audio plays out before we send the hangup frame
+/// and close the socket (port of the Claude Code plugin's `HANGUP_CLOSE_DELAY_S`).
+const HANGUP_CLOSE_DELAY_SECS: u64 = 2;
 
 // ── consult reply registry ────────────────────────────────────────────────
 
@@ -171,6 +179,11 @@ fn build_instructions(meta: &CallMeta) -> String {
                     .into(),
             );
             lines.push(format!("Caller name: {c}."));
+            // The full contact card: every email/phone/address on file, so the
+            // agent can act on "email me" / "text my other line" directly.
+            if let Some(card) = meta.contact_card.as_deref().filter(|s| !s.trim().is_empty()) {
+                lines.push(format!("Their full contact card:\n{card}"));
+            }
         }
         None => lines.push(
             "No matching contact record is loaded — you do NOT know who this is. Greet them \
@@ -419,6 +432,126 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Best display name for a contact: preferred name, else the assembled
+/// given/middle/family parts, else the company. Used for the short references
+/// (greeting line, post-call "Caller:" label).
+fn contact_display_name(c: &inkbox::contacts::types::Contact) -> Option<String> {
+    if let Some(p) = c.preferred_name.clone().filter(|s| !s.trim().is_empty()) {
+        return Some(p);
+    }
+    let parts: Vec<&str> = [
+        c.given_name.as_deref(),
+        c.middle_name.as_deref(),
+        c.family_name.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|s| !s.trim().is_empty())
+    .collect();
+    if !parts.is_empty() {
+        return Some(parts.join(" "));
+    }
+    c.company_name.clone().filter(|s| !s.trim().is_empty())
+}
+
+/// Render the caller's entire Inkbox contact card as a readable block — every
+/// populated field — so the agent has the full picture (all emails, phones,
+/// addresses, notes, custom fields) and can reach them however they ask.
+fn render_contact_card(c: &inkbox::contacts::types::Contact) -> String {
+    // Label + "(tag, tag)" suffix for the multi-value sections.
+    let tagged = |value: &str, label: &Option<String>, primary: bool| -> String {
+        let mut tags: Vec<String> = Vec::new();
+        if let Some(l) = label.as_deref().filter(|s| !s.trim().is_empty()) {
+            tags.push(l.to_string());
+        }
+        if primary {
+            tags.push("primary".into());
+        }
+        if tags.is_empty() {
+            value.to_string()
+        } else {
+            format!("{value} ({})", tags.join(", "))
+        }
+    };
+
+    let mut lines: Vec<String> = Vec::new();
+    let full_name: Vec<&str> = [
+        c.name_prefix.as_deref(),
+        c.given_name.as_deref(),
+        c.middle_name.as_deref(),
+        c.family_name.as_deref(),
+        c.name_suffix.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|s| !s.trim().is_empty())
+    .collect();
+    if !full_name.is_empty() {
+        lines.push(format!("- Name: {}", full_name.join(" ")));
+    }
+    if let Some(p) = c.preferred_name.as_deref().filter(|s| !s.trim().is_empty()) {
+        lines.push(format!("- Goes by: {p}"));
+    }
+    match (
+        c.company_name.as_deref().filter(|s| !s.trim().is_empty()),
+        c.job_title.as_deref().filter(|s| !s.trim().is_empty()),
+    ) {
+        (Some(co), Some(t)) => lines.push(format!("- Company: {co} ({t})")),
+        (Some(co), None) => lines.push(format!("- Company: {co}")),
+        (None, Some(t)) => lines.push(format!("- Title: {t}")),
+        _ => {}
+    }
+    if !c.emails.is_empty() {
+        let v: Vec<String> =
+            c.emails.iter().map(|e| tagged(&e.value, &e.label, e.is_primary)).collect();
+        lines.push(format!("- Emails: {}", v.join("; ")));
+    }
+    if !c.phones.is_empty() {
+        let v: Vec<String> =
+            c.phones.iter().map(|p| tagged(&p.value, &p.label, p.is_primary)).collect();
+        lines.push(format!("- Phones: {}", v.join("; ")));
+    }
+    if !c.websites.is_empty() {
+        let v: Vec<String> = c.websites.iter().map(|w| tagged(&w.value, &w.label, false)).collect();
+        lines.push(format!("- Websites: {}", v.join("; ")));
+    }
+    if let Some(b) = c.birthday.as_deref().filter(|s| !s.trim().is_empty()) {
+        lines.push(format!("- Birthday: {b}"));
+    }
+    if !c.dates.is_empty() {
+        let v: Vec<String> = c.dates.iter().map(|d| tagged(&d.value, &d.label, false)).collect();
+        lines.push(format!("- Dates: {}", v.join("; ")));
+    }
+    for a in &c.addresses {
+        // Join only the populated address parts, in postal order.
+        let parts: Vec<&str> = [
+            a.street.as_deref(),
+            a.city.as_deref(),
+            a.region.as_deref(),
+            a.postal_code.as_deref(),
+            a.country.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+        if !parts.is_empty() {
+            let label = a.label.as_deref().filter(|s| !s.trim().is_empty());
+            match label {
+                Some(l) => lines.push(format!("- Address ({l}): {}", parts.join(", "))),
+                None => lines.push(format!("- Address: {}", parts.join(", "))),
+            }
+        }
+    }
+    for f in &c.custom_fields {
+        lines.push(format!("- {}: {}", f.label, f.value));
+    }
+    if let Some(n) = c.notes.as_deref().filter(|s| !s.trim().is_empty()) {
+        lines.push(format!("- Notes: {n}"));
+    }
+    lines.join("\n")
+}
+
 /// Run the realtime bridge between the (already-upgraded) Inkbox call-media
 /// WebSocket and the OpenAI Realtime API. Returns when either side closes.
 #[allow(clippy::too_many_arguments)]
@@ -431,28 +564,65 @@ pub async fn run_realtime_bridge(
     alias: String,
     client: Arc<inkbox::Inkbox>,
     identity: String,
+    call_id: String,
 ) {
-    // Resolve our own identity so the model introduces itself as ZeroClaw with
-    // the right email/phone (blocking SDK call on the blocking pool).
+    // Resolve (a) our own identity so the model speaks as ZeroClaw, and (b) the
+    // CALLER's full contact card from the call record so the agent can act on
+    // requests like "send me an email" / "text my other line" without asking
+    // who they are or how to reach them. Blocking SDK calls on the blocking pool.
     let mut meta = meta;
     {
         let client = client.clone();
         let handle = identity.clone();
-        if let Ok((h, email, phone)) = tokio::task::spawn_blocking(move || match client
-            .get_identity(&handle)
-        {
-            Ok(id) => (
-                id.agent_handle(),
-                id.email_address(),
-                id.phone_number().map(|p| p.number),
-            ),
-            Err(_) => (handle, None, None),
+        let call_id = call_id.clone();
+        let resolved = tokio::task::spawn_blocking(move || {
+            let ident = client.get_identity(&handle).ok();
+            let (agent_handle, agent_email, agent_phone, phone_id) = match &ident {
+                Some(i) => (
+                    i.agent_handle(),
+                    i.email_address(),
+                    i.phone_number().map(|p| p.number),
+                    i.phone_number().map(|p| p.id.to_string()),
+                ),
+                None => (handle.clone(), None, None, None),
+            };
+            let mut caller_name = None;
+            let mut caller_card = None;
+            let mut direction = String::new();
+            if !call_id.is_empty() {
+                if let Some(pid) = phone_id.as_deref() {
+                    if let Ok(call) = client.calls().get(pid, &call_id) {
+                        direction = call.direction;
+                        let remote = call.remote_phone_number;
+                        if !remote.is_empty() {
+                            if let Ok(found) =
+                                client.contacts().lookup(None, None, None, Some(&remote), None)
+                            {
+                                if let Some(c) = found.first() {
+                                    caller_name = contact_display_name(c);
+                                    caller_card = Some(render_contact_card(c));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            (agent_handle, agent_email, agent_phone, caller_name, caller_card, direction)
         })
-        .await
-        {
-            meta.agent_handle = h;
-            meta.agent_email = email;
-            meta.agent_phone = phone;
+        .await;
+        if let Ok((ah, ae, ap, cn, card, dir)) = resolved {
+            meta.agent_handle = ah;
+            meta.agent_email = ae;
+            meta.agent_phone = ap;
+            if cn.is_some() {
+                meta.contact_name = cn;
+            }
+            if card.is_some() {
+                meta.contact_card = card;
+            }
+            if !dir.is_empty() {
+                meta.direction = dir;
+            }
         }
     }
     ::zeroclaw_log::record!(
@@ -479,6 +649,8 @@ pub async fn run_realtime_bridge(
     let mut pending: HashMap<String, PendingCall> = HashMap::new();
     let mut hangup_armed_at: Option<Instant> = None;
     let mut closing = false;
+    // Reason captured on the confirmed hang_up_call, sent with the hangup frame.
+    let mut hangup_reason = String::new();
 
     let greet_once = |out_tx: &mpsc::UnboundedSender<WsMessage>, sent: &mut bool| {
         if !*sent {
@@ -655,11 +827,14 @@ pub async fn run_realtime_bridge(
                                     .map(|t| t.elapsed() < Duration::from_secs(HANGUP_CONFIRM_WINDOW_SECS))
                                     .unwrap_or(false);
                                 if recent {
-                                    // Second call within the window → actually end.
-                                    let reason = args.get("reason").and_then(Value::as_str).unwrap_or("");
-                                    let mut hangup = json!({ "event": "hangup", "reason": reason });
-                                    if let Some(sid) = &stream_id { hangup["stream_id"] = json!(sid); }
-                                    let _ = ink_tx.send(Message::Text(hangup.to_string().into())).await;
+                                    // Second call within the window → end the call. We
+                                    // submit this tool result first, then (below, after
+                                    // the goodbye lands) send the hangup frame and close.
+                                    hangup_reason = args
+                                        .get("reason")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .to_string();
                                     closing = true;
                                     json!({ "status": "hangup_requested", "message": "The call is ending now." })
                                 } else {
@@ -675,7 +850,22 @@ pub async fn run_realtime_bridge(
                                 let _ = out_tx.send(response_create_empty());
                             }
                         }
-                        if closing { break; }
+                        if closing {
+                            // Let the spoken goodbye land, then drop the carrier leg:
+                            // send the hangup frame AND explicitly close the socket so
+                            // Inkbox actually tears down the call (a bare drop doesn't).
+                            tokio::time::sleep(Duration::from_secs(HANGUP_CLOSE_DELAY_SECS)).await;
+                            let mut hangup = json!({ "event": "hangup" });
+                            if !hangup_reason.is_empty() {
+                                hangup["reason"] = json!(hangup_reason);
+                            }
+                            if let Some(sid) = &stream_id {
+                                hangup["stream_id"] = json!(sid);
+                            }
+                            let _ = ink_tx.send(Message::Text(hangup.to_string().into())).await;
+                            let _ = ink_tx.close().await;
+                            break;
+                        }
                     }
                     _ => {}
                 }
@@ -768,6 +958,16 @@ fn dispatch_post_call(
         .collect::<Vec<_>>()
         .join("\n");
 
+    // The caller's full contact card, so the post-call turn knows exactly who
+    // to email/text without re-resolving or asking.
+    let caller_block = match meta.contact_card.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(card) => {
+            let who = meta.contact_name.as_deref().unwrap_or("the caller");
+            format!("\n\nCaller ({who}) contact card:\n{card}")
+        }
+        None => String::new(),
+    };
+
     let body = if post_call_actions.is_empty() {
         let mut b = format!(
             "[inkbox:voice_call call_id={}]\n[call_ended] The realtime voice call ended. \
@@ -778,6 +978,7 @@ fn dispatch_post_call(
              Any plain-text reply here is suppressed; side effects must come from tool calls.",
             meta.call_id
         );
+        b.push_str(&caller_block);
         if !transcript_block.is_empty() {
             b.push_str(&format!("\n\nRecent transcript:\n{transcript_block}"));
         }
@@ -801,6 +1002,7 @@ fn dispatch_post_call(
              a note, update a contact). Don't re-do anything already handled.\n\nQueued actions:\n{actions}",
             meta.call_id
         );
+        b.push_str(&caller_block);
         if !transcript_block.is_empty() {
             b.push_str(&format!("\n\nFull call transcript:\n{transcript_block}"));
         }
