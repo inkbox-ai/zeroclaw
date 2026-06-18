@@ -12210,6 +12210,14 @@ fn default_inkbox_base_url() -> String {
     "https://inkbox.ai".to_string()
 }
 
+fn default_inkbox_realtime_model() -> String {
+    "gpt-realtime-2".to_string()
+}
+
+fn default_inkbox_realtime_voice() -> String {
+    "cedar".to_string()
+}
+
 /// Inkbox channel configuration.
 ///
 /// One instance per agent identity. Inbound email/SMS/iMessage/voice arrive
@@ -12253,6 +12261,31 @@ pub struct InkboxConfig {
     /// Per-(channel, recipient) outbound pacing queue depth.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
+    /// Enable the OpenAI Realtime voice bridge for calls (raw g711 audio bridged
+    /// to a realtime model). Requires `realtime_api_key`; when off (or no key),
+    /// calls use Inkbox's built-in STT/TTS.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub realtime_enabled: bool,
+    /// OpenAI API key for the Realtime call bridge (`OPENAI_API_KEY` is the
+    /// usual source). Empty disables realtime regardless of `realtime_enabled`.
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default)]
+    pub realtime_api_key: String,
+    /// Realtime model id. Defaults to `gpt-realtime-2`.
+    #[tab(Connection)]
+    #[serde(default = "default_inkbox_realtime_model")]
+    pub realtime_model: String,
+    /// Realtime voice. Defaults to `cedar`.
+    #[tab(Connection)]
+    #[serde(default = "default_inkbox_realtime_voice")]
+    pub realtime_voice: String,
+    /// Fall back to Inkbox STT/TTS when the realtime bridge can't connect.
+    #[tab(Behavior)]
+    #[serde(default = "default_true")]
+    pub realtime_fallback: bool,
 }
 
 impl Default for InkboxConfig {
@@ -12266,6 +12299,11 @@ impl Default for InkboxConfig {
             excluded_tools: Vec::new(),
             reply_min_interval_secs: 0,
             reply_queue_depth_max: 0,
+            realtime_enabled: false,
+            realtime_api_key: String::new(),
+            realtime_model: default_inkbox_realtime_model(),
+            realtime_voice: default_inkbox_realtime_voice(),
+            realtime_fallback: true,
         }
     }
 }

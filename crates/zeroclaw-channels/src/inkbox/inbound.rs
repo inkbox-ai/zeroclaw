@@ -27,6 +27,8 @@ pub struct AppState {
     pub signing_key: String,
     /// ZeroClaw channel alias, stamped onto every inbound message.
     pub alias: String,
+    /// Realtime bridge config for calls; `None` uses Inkbox STT/TTS.
+    pub realtime: Option<super::realtime::RealtimeConfig>,
 }
 
 /// Build the loopback router: the call-media WebSocket on its fixed path, and
