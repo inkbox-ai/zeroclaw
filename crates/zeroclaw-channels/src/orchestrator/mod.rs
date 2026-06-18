@@ -7101,6 +7101,19 @@ fn collect_configured_channels(
                 continue;
             }
         };
+        // Realtime call bridge is active only when enabled AND credentialed.
+        let realtime = if crate::inkbox::RealtimeConfig::usable(
+            ic.realtime_enabled,
+            &ic.realtime_api_key,
+        ) {
+            Some(crate::inkbox::RealtimeConfig {
+                api_key: ic.realtime_api_key.clone(),
+                model: ic.realtime_model.clone(),
+                voice: ic.realtime_voice.clone(),
+            })
+        } else {
+            None
+        };
         channels.push(ConfiguredChannel {
             display_name: "Inkbox",
             alias: Some(alias.clone()),
@@ -7109,6 +7122,7 @@ fn collect_configured_channels(
                 ic.identity.clone(),
                 ic.signing_key.clone(),
                 alias.clone(),
+                realtime,
             )),
         });
     }

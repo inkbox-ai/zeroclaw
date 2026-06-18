@@ -17,7 +17,10 @@ use zeroclaw_api::attribution::{Attributable, ChannelKind, Role};
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
 mod inbound;
+mod realtime;
 mod voice;
+
+pub use realtime::RealtimeConfig;
 
 /// Loopback host the tunnel forwards inbound traffic to. The SDK's
 /// `validate_forward_target` requires a literal loopback address.
@@ -37,6 +40,9 @@ pub struct InkboxChannel {
     signing_key: String,
     /// ZeroClaw channel alias (the `<alias>` in `[channels.inkbox.<alias>]`).
     alias: String,
+    /// OpenAI Realtime bridge config for calls, when enabled + credentialed.
+    /// `None` falls back to Inkbox STT/TTS for voice.
+    realtime: Option<RealtimeConfig>,
 }
 
 impl InkboxChannel {
@@ -48,12 +54,14 @@ impl InkboxChannel {
         identity: impl Into<String>,
         signing_key: impl Into<String>,
         alias: impl Into<String>,
+        realtime: Option<RealtimeConfig>,
     ) -> Self {
         Self {
             inkbox,
             identity: identity.into(),
             signing_key: signing_key.into(),
             alias: alias.into(),
+            realtime,
         }
     }
 }
@@ -257,6 +265,7 @@ impl Channel for InkboxChannel {
             tx,
             signing_key: self.signing_key.clone(),
             alias: self.alias.clone(),
+            realtime: self.realtime.clone(),
         });
         let server = tokio::spawn(async move { axum::serve(listener, app).await });
 

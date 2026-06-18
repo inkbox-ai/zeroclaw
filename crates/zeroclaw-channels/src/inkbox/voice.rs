@@ -61,6 +61,25 @@ pub(super) fn speak_to_call(conn_id: &str, text: &str) -> bool {
 /// Upgrade the call-media connection, asking Inkbox to run STT + TTS, and hand
 /// the socket to the bridge loop.
 pub async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
+    // Realtime mode: ask Inkbox to send RAW audio (no STT/TTS) and bridge it to
+    // the OpenAI Realtime API. Falls back to Inkbox STT/TTS when not configured.
+    if let Some(rt) = state.realtime.clone() {
+        let meta = super::realtime::CallMeta::default();
+        let mut resp = ws
+            .on_upgrade(move |socket| super::realtime::run_realtime_bridge(socket, rt, meta))
+            .into_response();
+        let headers = resp.headers_mut();
+        headers.insert(
+            HeaderName::from_static("x-use-inkbox-speech-to-text"),
+            HeaderValue::from_static("false"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-use-inkbox-text-to-speech"),
+            HeaderValue::from_static("false"),
+        );
+        return resp;
+    }
+
     let mut resp = ws.on_upgrade(move |socket| bridge(socket, state)).into_response();
     // These ride back on the 101 the tunnel relays to Inkbox: run Inkbox's own
     // speech<->text so this leg is a text duplex (no external audio model).
