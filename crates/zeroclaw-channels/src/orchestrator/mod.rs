@@ -6981,6 +6981,7 @@ fn collect_configured_channels(
                 api_key: ic.realtime_api_key.clone(),
                 model: ic.realtime_model.clone(),
                 voice: ic.realtime_voice.clone(),
+                fallback: ic.realtime_fallback,
             })
         } else {
             None
