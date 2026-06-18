@@ -11,9 +11,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::get;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
 use axum::Router;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use zeroclaw_api::channel::ChannelMessage;
 
@@ -33,6 +34,9 @@ pub struct AppState {
     /// agent's own identity (so the model speaks as ZeroClaw with real contacts).
     pub inkbox: std::sync::Arc<inkbox::Inkbox>,
     pub identity: String,
+    /// Tunnel public host (e.g. `abc.inkbox.ai`), used to build the call-media
+    /// WS URL we hand back from the incoming-call webhook with `?call_id=`.
+    pub public_host: String,
 }
 
 /// Build the loopback router: the call-media WebSocket on its fixed path, and
@@ -41,8 +45,52 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/phone/media/ws", get(super::voice::ws_handler))
+        .route("/incoming-call", post(incoming_call))
         .fallback(webhook)
         .with_state(state)
+}
+
+/// Incoming-call webhook. With the phone number set to
+/// `incoming_call_action="webhook"`, Inkbox calls this synchronously when a
+/// call arrives and uses our response to bridge the audio. We answer and hand
+/// back the call-media WS URL stamped with `?call_id=<id>` — the realtime
+/// bridge reads that id to resolve the caller's contact card. Verified like the
+/// other webhooks, but fail-open on the answer so a signing hiccup never drops
+/// a live call (the response only points Inkbox at our own socket).
+async fn incoming_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    let mut header_map = HashMap::with_capacity(headers.len());
+    for (k, v) in headers.iter() {
+        if let Ok(s) = v.to_str() {
+            header_map.insert(k.as_str().to_string(), s.to_string());
+        }
+    }
+    if !matches!(
+        inkbox::signing_keys::verify_webhook(&body, &header_map, &state.signing_key),
+        Ok(true)
+    ) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "[inkbox] incoming-call webhook failed signature check; answering anyway",
+        );
+    }
+
+    let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    // The Inkbox call id — flat on the payload, with a /data fallback.
+    let call_id = payload
+        .get("id")
+        .and_then(Value::as_str)
+        .or_else(|| payload.pointer("/data/id").and_then(Value::as_str))
+        .unwrap_or("");
+    let ws = format!("wss://{}/phone/media/ws?call_id={call_id}", state.public_host);
+
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        format!("[inkbox] answering incoming call (call_id={call_id})"),
+    );
+    axum::Json(json!({ "action": "answer", "client_websocket_url": ws })).into_response()
 }
 
 /// Webhook entry point. Verifies the signature, parses the event, and forwards
