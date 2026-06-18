@@ -142,6 +142,25 @@ impl Channel for InkboxChannel {
         "inkbox"
     }
 
+    /// Show a typing bubble while composing a reply — iMessage only (SMS/email
+    /// have no typing indicator). The orchestrator calls this on a refresh loop
+    /// (iMessage bubbles expire after a few seconds), so we just send one ping
+    /// per call. Best-effort: a typing failure never blocks the reply.
+    async fn start_typing(&self, recipient: &str) -> Result<()> {
+        let Some(cid) = recipient.strip_prefix("imessage:") else {
+            return Ok(());
+        };
+        let Ok(conversation_id) = uuid::Uuid::parse_str(cid) else {
+            return Ok(());
+        };
+        let inkbox = self.inkbox.clone();
+        // Blocking SDK request on the blocking pool; ignore errors.
+        let _ =
+            tokio::task::spawn_blocking(move || inkbox.imessages().send_typing(&conversation_id))
+                .await;
+        Ok(())
+    }
+
     /// Send an outbound reply. `recipient` is a tagged target stamped by the
     /// inbound handlers: `"email:<addr>"`, `"sms:<conversation_id>"`, or
     /// `"imessage:<conversation_id>"`. Routes to the matching Inkbox API call.
