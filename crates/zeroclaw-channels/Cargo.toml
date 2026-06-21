@@ -166,10 +166,10 @@ cbc = { version = "0.1", optional = true }
 ecb = { version = "0.1", optional = true }
 md5 = { version = "0.8", optional = true }
 
-# Inkbox channel (optional) — local fork integration. Path dependency on the
-# in-repo Rust SDK; `tunnels-runtime` pulls in the HTTP/2 reverse-proxy data
-# plane that delivers inbound webhooks + call media over the Inkbox tunnel.
-inkbox = { path = "../../../inkbox/sdk/rust", default-features = false, features = [
+# Inkbox channel (optional). Published Rust SDK from crates.io;
+# `tunnels-runtime` pulls in the HTTP/2 reverse-proxy data plane that delivers
+# inbound webhooks + call media over the Inkbox tunnel.
+inkbox = { version = "0.4.9", default-features = false, features = [
   "tunnels-runtime",
 ], optional = true }
 

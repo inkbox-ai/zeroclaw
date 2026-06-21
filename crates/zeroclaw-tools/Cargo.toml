@@ -54,7 +54,8 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring
 webpki-roots = "1.0.6"
 
 # Inkbox SDK (REST surface only — the tunnel data plane lives in the channel).
-inkbox = { path = "../../../inkbox/sdk/rust", default-features = false, optional = true }
+# Published crate from crates.io.
+inkbox = { version = "0.4.9", default-features = false, optional = true }
 
 [features]
 default = []
