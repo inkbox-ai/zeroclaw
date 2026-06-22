@@ -20503,6 +20503,32 @@ mod tests {
     }
 
     #[test]
+    async fn inkbox_config_default_matches_helpers_and_deserializes() {
+        use super::*;
+        // The hand-rolled Default must not drift from the default_inkbox_* helpers.
+        let d = InkboxConfig::default();
+        assert_eq!(d.base_url, default_inkbox_base_url());
+        assert_eq!(d.realtime_model, default_inkbox_realtime_model());
+        assert_eq!(d.realtime_voice, default_inkbox_realtime_voice());
+        assert!(!d.enabled);
+        assert!(d.realtime_fallback); // default_true
+
+        // A minimal block fills required fields and serde-defaults the rest.
+        let cfg: InkboxConfig = toml::from_str(
+            r#"
+            api_key = "ApiKey_x"
+            identity = "zero-claw-inkbox"
+            "#,
+        )
+        .expect("inkbox config deserializes");
+        assert_eq!(cfg.identity, "zero-claw-inkbox");
+        assert_eq!(cfg.base_url, "https://inkbox.ai");
+        assert_eq!(cfg.realtime_model, "gpt-realtime-2");
+        assert!(cfg.realtime_fallback);
+        assert!(!cfg.realtime_enabled);
+    }
+
+    #[test]
     async fn amqp_validate_requires_paired_client_cert_and_key() {
         let base = AmqpConfig {
             enabled: true,
@@ -23510,6 +23536,7 @@ allowed_users = ["@u:matrix.org"]
     async fn channels_with_imessage_and_matrix() {
         let c = ChannelsConfig {
             cli: true,
+            inkbox: HashMap::new(),
             telegram: HashMap::new(),
             discord: HashMap::new(),
             slack: HashMap::new(),
