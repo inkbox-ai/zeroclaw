@@ -26,6 +26,54 @@ pub use realtime::RealtimeConfig;
 /// `validate_forward_target` requires a literal loopback address.
 const FORWARD_HOST: &str = "127.0.0.1";
 
+/// Seconds since the Unix epoch, for `ChannelMessage` timestamps. Shared by the
+/// inbound webhook + call-media handlers.
+pub(super) fn now_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A parsed reply-target routing decision. The inbound handlers stamp
+/// `recipient` as `"<mode>:<id>"`; this classifies it (a bare string with no
+/// tag falls back to SMS so a hand-built target still routes). Pure + unit-tested.
+enum ReplyRoute<'a> {
+    /// Post-call reflection turns and other non-delivery targets.
+    Noreply,
+    /// Live STT/TTS call leg (`conn_id`).
+    Call(&'a str),
+    /// In-call consult answer (`consult id`).
+    Consult(&'a str),
+    Email(&'a str),
+    Sms(&'a str),
+    SmsTo(&'a str),
+    Imessage(&'a str),
+    /// Tagged with an unrecognized mode.
+    Unknown(&'a str),
+}
+
+fn reply_route(target: &str) -> ReplyRoute<'_> {
+    if target == "noreply" {
+        return ReplyRoute::Noreply;
+    }
+    if let Some(c) = target.strip_prefix("call:") {
+        return ReplyRoute::Call(c);
+    }
+    if let Some(c) = target.strip_prefix("consult:") {
+        return ReplyRoute::Consult(c);
+    }
+    let (mode, id) = target.split_once(':').unwrap_or(("sms", target));
+    match mode {
+        "email" => ReplyRoute::Email(id),
+        "sms" => ReplyRoute::Sms(id),
+        "smsto" => ReplyRoute::SmsTo(id),
+        "imessage" => ReplyRoute::Imessage(id),
+        _ => ReplyRoute::Unknown(mode),
+    }
+}
+
 /// Native Inkbox channel bound to a single agent identity.
 ///
 /// Holds the blocking [`Inkbox`] client (`Send + Sync`) rather than an
@@ -87,7 +135,9 @@ fn reconcile_routing(inkbox: &Arc<Inkbox>, handle: &str) -> Result<()> {
         .tunnel()
         .map(|t| t.public_host)
         .filter(|h| !h.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("identity {handle:?} has no tunnel public_host"))?;
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!("identity {handle:?} has no tunnel public_host"))
+        })?;
     let webhook_url = format!("https://{public_host}/webhook");
 
     let ns = inkbox.webhooks();
@@ -101,11 +151,23 @@ fn reconcile_routing(inkbox: &Arc<Inkbox>, handle: &str) -> Result<()> {
                   agent_id: Option<uuid::Uuid>|
      -> Result<()> {
         let existing = subs
-            .list(mailbox_id, phone_id, agent_id, Some(webhook_url.as_str()), Some(event))
+            .list(
+                mailbox_id,
+                phone_id,
+                agent_id,
+                Some(webhook_url.as_str()),
+                Some(event),
+            )
             .with_context(|| format!("list Inkbox {event} subscriptions"))?;
         if existing.is_empty() {
-            subs.create(&webhook_url, &[event.to_string()], mailbox_id, phone_id, agent_id)
-                .with_context(|| format!("create Inkbox {event} subscription"))?;
+            subs.create(
+                &webhook_url,
+                &[event.to_string()],
+                mailbox_id,
+                phone_id,
+                agent_id,
+            )
+            .with_context(|| format!("create Inkbox {event} subscription"))?;
         }
         Ok(())
     };
@@ -166,10 +228,19 @@ impl Channel for InkboxChannel {
             return Ok(());
         };
         let inkbox = self.inkbox.clone();
-        // Blocking SDK request on the blocking pool; ignore errors.
-        let _ =
+        // Blocking SDK request on the blocking pool. Best-effort: a typing
+        // failure must never block the reply, but log at debug so a persistently
+        // failing indicator is diagnosable.
+        if let Ok(Err(e)) =
             tokio::task::spawn_blocking(move || inkbox.imessages().send_typing(&conversation_id))
-                .await;
+                .await
+        {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                format!("[inkbox] iMessage typing indicator failed: {e}"),
+            );
+        }
         Ok(())
     }
 
@@ -177,22 +248,28 @@ impl Channel for InkboxChannel {
     /// inbound handlers: `"email:<addr>"`, `"sms:<conversation_id>"`, or
     /// `"imessage:<conversation_id>"`. Routes to the matching Inkbox API call.
     async fn send(&self, message: &SendMessage) -> Result<()> {
-        // Live call replies go to the open WebSocket as TTS, not the REST API,
-        // and need no identity round-trip — handle them before the blocking path.
-        // Live-call audio replies (STT/TTS path) go to the open socket; a miss
-        // means the call already ended — drop quietly. Post-call reflection
-        // turns also target `call:<id>` / `noreply` and need no delivery.
-        if message.recipient == "noreply" {
-            return Ok(());
-        }
-        if let Some(conn_id) = message.recipient.strip_prefix("call:") {
-            voice::speak_to_call(conn_id, &message.content);
-            return Ok(());
-        }
-        // In-call consult: route the agent's answer back to the realtime bridge.
-        if let Some(id) = message.recipient.strip_prefix("consult:") {
-            realtime::deliver_consult(id, &message.content);
-            return Ok(());
+        // Non-REST targets are handled before the blocking path: live-call audio
+        // replies go to the open socket (a miss means the call already ended —
+        // drop quietly), consult answers go back to the realtime bridge, and
+        // post-call reflection turns (`noreply`) need no delivery.
+        match reply_route(&message.recipient) {
+            ReplyRoute::Noreply => return Ok(()),
+            ReplyRoute::Call(conn_id) => {
+                if !voice::speak_to_call(conn_id, &message.content) {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        format!("[inkbox] reply for call {conn_id} dropped — leg already ended"),
+                    );
+                }
+                return Ok(());
+            }
+            ReplyRoute::Consult(id) => {
+                realtime::deliver_consult(id, &message.content);
+                return Ok(());
+            }
+            // Delivery targets fall through to the blocking REST path below.
+            _ => {}
         }
 
         // Clone everything needed into the blocking task: the AgentIdentity
@@ -209,11 +286,8 @@ impl Channel for InkboxChannel {
                 .get_identity(&handle)
                 .with_context(|| format!("resolve Inkbox identity {handle:?}"))?;
 
-            // Split the tagged reply target into (mode, id). Bare strings with
-            // no tag fall back to SMS so a hand-built target still routes.
-            let (mode, id) = target.split_once(':').unwrap_or(("sms", target.as_str()));
-            match mode {
-                "email" => {
+            match reply_route(&target) {
+                ReplyRoute::Email(id) => {
                     let to = [id.to_string()];
                     identity.send_email(
                         &to,
@@ -226,22 +300,26 @@ impl Channel for InkboxChannel {
                         None,
                     )?;
                 }
-                "sms" => {
+                ReplyRoute::Sms(id) => {
                     identity.send_text(None, Some(id), Some(content.as_str()), None)?;
                 }
-                "smsto" => {
+                ReplyRoute::SmsTo(id) => {
                     // Bare remote number (no conversation row yet): send via
                     // `to`, not `conversation_id`.
                     let to = inkbox::phone::resources::texts::TextRecipients::One(id.to_string());
                     identity.send_text(Some(to), None, Some(content.as_str()), None)?;
                 }
-                "imessage" => {
+                ReplyRoute::Imessage(id) => {
                     let cid = uuid::Uuid::parse_str(id).map_err(|e| {
-                        anyhow::anyhow!("invalid iMessage conversation id {id:?}: {e}")
+                        anyhow::Error::msg(format!("invalid iMessage conversation id {id:?}: {e}"))
                     })?;
                     identity.send_imessage(None, Some(&cid), Some(content.as_str()), None, None)?;
                 }
-                other => anyhow::bail!("unknown Inkbox reply-target mode {other:?}"),
+                ReplyRoute::Unknown(mode) => {
+                    anyhow::bail!("unknown Inkbox reply-target mode {mode:?}")
+                }
+                // Non-delivery targets were handled before the blocking hop.
+                ReplyRoute::Noreply | ReplyRoute::Call(_) | ReplyRoute::Consult(_) => {}
             }
             Ok(())
         })
@@ -291,6 +369,16 @@ impl Channel for InkboxChannel {
             });
             host_rx.await.unwrap_or_default()
         };
+        if public_host.is_empty() {
+            // Without it, the incoming-call answer URL is malformed and the
+            // realtime bridge can't resolve callers — surface the broken lookup.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "[inkbox] could not resolve tunnel public_host; incoming-call routing will be degraded",
+            );
+        }
 
         // Loopback server that receives the tunnel-forwarded webhooks + call WS.
         let app = inbound::router(inbound::AppState {
@@ -302,7 +390,7 @@ impl Channel for InkboxChannel {
             identity: self.identity.clone(),
             public_host,
         });
-        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let server = zeroclaw_spawn::spawn!(async move { axum::serve(listener, app).await });
 
         // Point Inkbox at this tunnel (idempotent) before opening the data
         // plane, so inbound mail/text/iMessage/calls actually route here.
@@ -342,7 +430,9 @@ impl Channel for InkboxChannel {
             r = tunnel_rx => match r {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(anyhow::Error::new(e).context("Inkbox tunnel runtime exited")),
-                Err(_) => Err(anyhow::anyhow!("Inkbox tunnel thread ended without a result")),
+                Err(_) => {
+                    Err(anyhow::Error::msg("Inkbox tunnel thread ended without a result"))
+                }
             },
             r = server => match r {
                 Ok(Ok(())) => Ok(()),
@@ -350,5 +440,46 @@ impl Channel for InkboxChannel {
                 Err(e) => Err(anyhow::Error::new(e).context("Inkbox server task failed")),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reply_route_classifies_every_target_shape() {
+        assert!(matches!(reply_route("noreply"), ReplyRoute::Noreply));
+        assert!(matches!(reply_route("call:c7"), ReplyRoute::Call("c7")));
+        assert!(matches!(
+            reply_route("consult:42"),
+            ReplyRoute::Consult("42")
+        ));
+        assert!(matches!(
+            reply_route("email:a@b.com"),
+            ReplyRoute::Email("a@b.com")
+        ));
+        assert!(matches!(
+            reply_route("sms:conv-1"),
+            ReplyRoute::Sms("conv-1")
+        ));
+        assert!(matches!(
+            reply_route("smsto:+15551230000"),
+            ReplyRoute::SmsTo("+15551230000")
+        ));
+        assert!(matches!(
+            reply_route("imessage:ic-2"),
+            ReplyRoute::Imessage("ic-2")
+        ));
+        // A bare string with no tag falls back to SMS.
+        assert!(matches!(
+            reply_route("+15551230000"),
+            ReplyRoute::Sms("+15551230000")
+        ));
+        // A tagged-but-unrecognized mode is reported, not silently treated as SMS.
+        assert!(matches!(
+            reply_route("slack:xyz"),
+            ReplyRoute::Unknown("slack")
+        ));
     }
 }

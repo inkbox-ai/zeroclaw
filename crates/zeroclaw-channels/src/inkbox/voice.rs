@@ -17,9 +17,8 @@
 //! Inkbox STT/TTS path needs no external model.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
@@ -28,10 +27,14 @@ use axum::response::{IntoResponse, Response};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use zeroclaw_api::channel::ChannelMessage;
 
 use super::inbound::AppState;
+
+/// Opening line spoken on pickup in the Inkbox-managed STT/TTS path (the
+/// realtime path builds its own identity-aware greeting).
+const STT_GREETING: &str = "Hi there, how can I help?";
 
 /// Per-process monotonic id for each live call leg. A local id (rather than the
 /// Inkbox call id) keeps the reply registry self-contained: we mint it on
@@ -60,7 +63,7 @@ pub(super) fn speak_to_call(conn_id: &str, text: &str) -> bool {
 
 /// Upgrade the call-media connection, asking Inkbox to run STT + TTS, and hand
 /// the socket to the bridge loop.
-pub async fn ws_handler(
+pub(crate) async fn ws_handler(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
     ws: WebSocketUpgrade,
@@ -85,7 +88,17 @@ pub async fn ws_handler(
                 let mut resp = ws
                     .on_upgrade(move |socket| {
                         super::realtime::run_realtime_bridge(
-                            socket, openai, rt, meta, tx, alias, client, identity, call_id,
+                            socket,
+                            openai,
+                            tx,
+                            super::realtime::BridgeSetup {
+                                cfg: rt,
+                                meta,
+                                alias,
+                                client,
+                                identity,
+                                call_id,
+                            },
                         )
                     })
                     .into_response();
@@ -105,7 +118,9 @@ pub async fn ws_handler(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                    format!("[inkbox] realtime connect failed; falling back to Inkbox STT/TTS: {e}"),
+                    format!(
+                        "[inkbox] realtime connect failed; falling back to Inkbox STT/TTS: {e}"
+                    ),
                 );
                 // fall through to the STT/TTS path below
             }
@@ -125,7 +140,9 @@ pub async fn ws_handler(
         }
     }
 
-    let mut resp = ws.on_upgrade(move |socket| bridge(socket, state)).into_response();
+    let mut resp = ws
+        .on_upgrade(move |socket| bridge(socket, state))
+        .into_response();
     // These ride back on the 101 the tunnel relays to Inkbox: run Inkbox's own
     // speech<->text so this leg is a text duplex (no external audio model).
     let headers = resp.headers_mut();
@@ -193,7 +210,7 @@ async fn bridge(socket: WebSocket, state: AppState) {
                 match frame.get("event").and_then(Value::as_str) {
                     // Call connected: greet so the caller hears something on pickup.
                     Some("start") => {
-                        if !speak_turn(&mut sink, "greeting", "Hi there, how can I help?").await {
+                        if !speak_turn(&mut sink, "greeting", STT_GREETING).await {
                             break;
                         }
                     }
@@ -215,11 +232,19 @@ async fn bridge(socket: WebSocket, state: AppState) {
                             format!("call:{conn_id}"),
                             text,
                             "inkbox",
-                            now_secs(),
+                            super::now_secs(),
                         );
                         cm.channel_alias = Some(state.alias.clone());
-                        // Drop on backpressure rather than wedge the call leg.
-                        let _ = state.tx.try_send(cm);
+                        // Drop on backpressure rather than wedge the call leg, but
+                        // log it — a dropped caller turn shouldn't vanish silently.
+                        if let Err(e) = state.tx.try_send(cm) {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                                format!("[inkbox] dropped caller transcript (conn={conn_id}): {e}"),
+                            );
+                        }
                     }
                     _ => {}
                 }
@@ -233,12 +258,4 @@ async fn bridge(socket: WebSocket, state: AppState) {
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
         format!("[inkbox] call-media WebSocket closed (conn={conn_id})"),
     );
-}
-
-/// Seconds since the Unix epoch, for the `ChannelMessage` timestamp.
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }

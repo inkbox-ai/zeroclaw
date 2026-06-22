@@ -6,15 +6,14 @@
 //! `reply_target` the channel's `send` understands.
 
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::Router;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use zeroclaw_api::channel::ChannelMessage;
 
@@ -33,6 +32,7 @@ pub struct AppState {
     /// Inkbox client + identity handle, for the realtime bridge to resolve the
     /// agent's own identity (so the model speaks as ZeroClaw with real contacts).
     pub inkbox: std::sync::Arc<inkbox::Inkbox>,
+    /// Agent identity handle the realtime bridge resolves its own contact card from.
     pub identity: String,
     /// Tunnel public host (e.g. `abc.inkbox.ai`), used to build the call-media
     /// WS URL we hand back from the incoming-call webhook with `?call_id=`.
@@ -42,7 +42,7 @@ pub struct AppState {
 /// Build the loopback router: the call-media WebSocket on its fixed path, and
 /// a catch-all fallback that treats every other request as a webhook (the
 /// tunnel preserves whatever path Inkbox's subscription posts to).
-pub fn router(state: AppState) -> Router {
+pub(crate) fn router(state: AppState) -> Router {
     Router::new()
         .route("/phone/media/ws", get(super::voice::ws_handler))
         .route("/incoming-call", post(incoming_call))
@@ -54,9 +54,13 @@ pub fn router(state: AppState) -> Router {
 /// `incoming_call_action="webhook"`, Inkbox calls this synchronously when a
 /// call arrives and uses our response to bridge the audio. We answer and hand
 /// back the call-media WS URL stamped with `?call_id=<id>` — the realtime
-/// bridge reads that id to resolve the caller's contact card. Verified like the
-/// other webhooks, but fail-open on the answer so a signing hiccup never drops
-/// a live call (the response only points Inkbox at our own socket).
+/// bridge reads that id to resolve the caller's contact card.
+///
+/// Fails CLOSED at the trust boundary: Inkbox signs this webhook (the same V2
+/// `X-Inkbox-*` scheme `webhook` verifies), so an unsigned/forged request is
+/// rejected rather than answered — answering one would let an attacker drive a
+/// call leg and the (paid) realtime bridge. The `call_id` is validated as a
+/// UUID before it is trusted in the WS URL / contact resolution.
 async fn incoming_call(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let mut header_map = HashMap::with_capacity(headers.len());
     for (k, v) in headers.iter() {
@@ -70,20 +74,44 @@ async fn incoming_call(State(state): State<AppState>, headers: HeaderMap, body: 
     ) {
         ::zeroclaw_log::record!(
             WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-            "[inkbox] incoming-call webhook failed signature check; answering anyway",
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+            "[inkbox] rejecting incoming-call webhook with invalid or missing signature",
         );
+        return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let payload: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "[inkbox] incoming-call webhook body was not valid JSON; declining",
+            );
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
     // The Inkbox call id — flat on the payload, with a /data fallback.
     let call_id = payload
         .get("id")
         .and_then(Value::as_str)
         .or_else(|| payload.pointer("/data/id").and_then(Value::as_str))
         .unwrap_or("");
-    let ws = format!("wss://{}/phone/media/ws?call_id={call_id}", state.public_host);
+    if uuid::Uuid::parse_str(call_id).is_err() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+            "[inkbox] incoming-call webhook has no valid call id; declining",
+        );
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let ws = format!(
+        "wss://{}/phone/media/ws?call_id={call_id}",
+        state.public_host
+    );
 
     ::zeroclaw_log::record!(
         INFO,
@@ -125,18 +153,19 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: Bytes)
     };
 
     if let Some(msg) = map_event(&payload, &state.alias) {
-        // A full inbound queue should not wedge the tunnel; drop on backpressure.
-        let _ = state.tx.try_send(msg);
+        // A full inbound queue must not wedge the tunnel, so we drop on
+        // backpressure — but a silently lost inbound message is exactly the kind
+        // of failure worth seeing, so log it.
+        if let Err(e) = state.tx.try_send(msg) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                format!("[inkbox] dropped inbound message on backpressure: {e}"),
+            );
+        }
     }
     StatusCode::OK
-}
-
-/// Seconds since the Unix epoch, for the `ChannelMessage` timestamp.
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// Resolve a human display name + optional Inkbox id for the remote party from
@@ -149,12 +178,21 @@ fn now_secs() -> u64 {
 /// number/address) when nothing resolved.
 fn resolve_party(data: Option<&Value>, fallback: &str) -> (String, Option<String>) {
     let first = |key: &str| -> Option<&Value> {
-        data?.get(key).and_then(Value::as_array).and_then(|a| a.first())
+        data?
+            .get(key)
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
     };
-    if let Some(c) = first("contacts") {
-        if let Some(name) = c.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-            return (name.to_string(), c.get("id").and_then(Value::as_str).map(str::to_string));
-        }
+    if let Some(c) = first("contacts")
+        && let Some(name) = c
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    {
+        return (
+            name.to_string(),
+            c.get("id").and_then(Value::as_str).map(str::to_string),
+        );
     }
     if let Some(ai) = first("agent_identities") {
         let name = ai
@@ -164,7 +202,10 @@ fn resolve_party(data: Option<&Value>, fallback: &str) -> (String, Option<String
             .or_else(|| ai.get("agent_handle").and_then(Value::as_str))
             .filter(|s| !s.is_empty());
         if let Some(name) = name {
-            return (name.to_string(), ai.get("id").and_then(Value::as_str).map(str::to_string));
+            return (
+                name.to_string(),
+                ai.get("id").and_then(Value::as_str).map(str::to_string),
+            );
         }
     }
     (fallback.to_string(), None)
@@ -186,7 +227,7 @@ fn with_party_marker(label: &str, addr: &str, contact_id: Option<&str>, body: &s
 /// are handled over the WebSocket). The `reply_target` is tagged
 /// `"<mode>:<id>"` so `InkboxChannel::send` can route the agent's reply.
 fn map_event(payload: &Value, alias: &str) -> Option<ChannelMessage> {
-    let ts = now_secs();
+    let ts = super::now_secs();
     let with_alias = |mut cm: ChannelMessage| {
         cm.channel_alias = Some(alias.to_string());
         cm
@@ -208,17 +249,15 @@ fn map_event(payload: &Value, alias: &str) -> Option<ChannelMessage> {
                 .or_else(|| m.get("id").and_then(Value::as_str))
                 .unwrap_or("")
                 .to_string();
-            let body = m.get("snippet").and_then(Value::as_str).unwrap_or("").to_string();
+            let body = m
+                .get("snippet")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             let (label, contact_id) = resolve_party(payload.get("data"), &from);
             let content = with_party_marker(&label, &from, contact_id.as_deref(), &body);
-            let mut cm = ChannelMessage::new(
-                id,
-                label,
-                format!("email:{from}"),
-                content,
-                "inkbox",
-                ts,
-            );
+            let mut cm =
+                ChannelMessage::new(id, label, format!("email:{from}"), content, "inkbox", ts);
             cm.subject = m.get("subject").and_then(Value::as_str).map(str::to_string);
             Some(with_alias(cm))
         }
@@ -230,8 +269,16 @@ fn map_event(payload: &Value, alias: &str) -> Option<ChannelMessage> {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let text = t.get("text").and_then(Value::as_str).unwrap_or("").to_string();
-            let id = t.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+            let text = t
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let id = t
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             // Reply into the existing conversation when Inkbox gives us one;
             // otherwise reply to the bare remote number via `to`. A phone
             // number is NOT a conversation id, so it must route through the
@@ -263,8 +310,16 @@ fn map_event(payload: &Value, alias: &str) -> Option<ChannelMessage> {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let content = m.get("content").and_then(Value::as_str).unwrap_or("").to_string();
-            let id = m.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+            let content = m
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let id = m
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             let convo = m
                 .get("conversation_id")
                 .and_then(Value::as_str)
@@ -282,5 +337,115 @@ fn map_event(payload: &Value, alias: &str) -> Option<ChannelMessage> {
             )))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn email_event_maps_to_email_target_and_threads_by_message_id() {
+        let payload = json!({
+            "event_type": "message.received",
+            "data": {
+                "message": {
+                    "from_address": "alice@example.com",
+                    "message_id": "<msg-123@mail>",
+                    "id": "row-9",
+                    "snippet": "hi there",
+                    "subject": "Hello"
+                },
+                "contacts": [{ "id": "c1", "name": "Alice" }]
+            }
+        });
+        let cm = map_event(&payload, "zc").expect("email event maps");
+        assert_eq!(cm.reply_target, "email:alice@example.com");
+        assert_eq!(cm.id, "<msg-123@mail>"); // Message-ID preferred over row id
+        assert_eq!(cm.sender, "Alice");
+        assert_eq!(cm.subject.as_deref(), Some("Hello"));
+        assert_eq!(cm.channel_alias.as_deref(), Some("zc"));
+        assert!(cm.content.contains("Alice"));
+    }
+
+    #[test]
+    fn email_falls_back_to_row_id_without_message_id() {
+        let payload = json!({
+            "event_type": "message.received",
+            "data": { "message": { "from_address": "a@b.com", "id": "row-9", "snippet": "" } }
+        });
+        assert_eq!(map_event(&payload, "zc").unwrap().id, "row-9");
+    }
+
+    #[test]
+    fn sms_with_conversation_uses_sms_target_else_smsto() {
+        let with_conv = json!({
+            "event_type": "text.received",
+            "data": { "text_message": { "remote_phone_number": "+15551230000", "text": "yo", "id": "t1", "conversation_id": "conv-7" } }
+        });
+        assert_eq!(
+            map_event(&with_conv, "zc").unwrap().reply_target,
+            "sms:conv-7"
+        );
+
+        let no_conv = json!({
+            "event_type": "text.received",
+            "data": { "text_message": { "remote_phone_number": "+15551230000", "text": "yo", "id": "t1" } }
+        });
+        assert_eq!(
+            map_event(&no_conv, "zc").unwrap().reply_target,
+            "smsto:+15551230000"
+        );
+    }
+
+    #[test]
+    fn imessage_maps_to_conversation_target() {
+        let payload = json!({
+            "event_type": "imessage.received",
+            "data": { "message": { "remote_number": "+15551230000", "content": "hi", "id": "m1", "conversation_id": "ic-2" } }
+        });
+        assert_eq!(
+            map_event(&payload, "zc").unwrap().reply_target,
+            "imessage:ic-2"
+        );
+    }
+
+    #[test]
+    fn unknown_and_lifecycle_events_are_dropped() {
+        assert!(map_event(&json!({ "event_type": "message.delivered" }), "zc").is_none());
+        assert!(map_event(&json!({}), "zc").is_none());
+    }
+
+    #[test]
+    fn resolve_party_prefers_contacts_then_identities_then_fallback() {
+        let contacts = json!({ "contacts": [{ "id": "c1", "name": "Alice" }] });
+        assert_eq!(resolve_party(Some(&contacts), "x@y").0, "Alice");
+
+        let identities = json!({ "agent_identities": [{ "id": "a1", "display_name": "Bot" }] });
+        assert_eq!(
+            resolve_party(Some(&identities), "x@y"),
+            ("Bot".into(), Some("a1".into()))
+        );
+
+        let empty = json!({ "contacts": [], "agent_identities": [] });
+        assert_eq!(resolve_party(Some(&empty), "x@y").0, "x@y");
+        assert_eq!(resolve_party(None, "x@y"), ("x@y".to_string(), None));
+    }
+
+    #[test]
+    fn party_marker_shapes() {
+        assert_eq!(
+            with_party_marker("Alice", "a@b", Some("c1"), "body"),
+            "[from Alice <a@b> · inkbox contact_id=c1]\nbody"
+        );
+        assert_eq!(
+            with_party_marker("Alice", "a@b", None, "body"),
+            "[from Alice <a@b>]\nbody"
+        );
+        // label == addr collapses to a single token
+        assert_eq!(
+            with_party_marker("a@b", "a@b", None, "body"),
+            "[from a@b]\nbody"
+        );
     }
 }

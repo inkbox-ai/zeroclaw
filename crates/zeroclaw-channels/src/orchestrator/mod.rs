@@ -7077,7 +7077,9 @@ fn collect_configured_channels(
         let api_key = ic.api_key.clone();
         let base_url = ic.base_url.clone();
         let built = std::thread::spawn(move || {
-            ::inkbox::Inkbox::builder(api_key).base_url(base_url).build()
+            ::inkbox::Inkbox::builder(api_key)
+                .base_url(base_url)
+                .build()
         })
         .join();
         let client = match built {
@@ -7102,19 +7104,17 @@ fn collect_configured_channels(
             }
         };
         // Realtime call bridge is active only when enabled AND credentialed.
-        let realtime = if crate::inkbox::RealtimeConfig::usable(
-            ic.realtime_enabled,
-            &ic.realtime_api_key,
-        ) {
-            Some(crate::inkbox::RealtimeConfig {
-                api_key: ic.realtime_api_key.clone(),
-                model: ic.realtime_model.clone(),
-                voice: ic.realtime_voice.clone(),
-                fallback: ic.realtime_fallback,
-            })
-        } else {
-            None
-        };
+        let realtime =
+            if crate::inkbox::RealtimeConfig::usable(ic.realtime_enabled, &ic.realtime_api_key) {
+                Some(crate::inkbox::RealtimeConfig {
+                    api_key: ic.realtime_api_key.clone(),
+                    model: ic.realtime_model.clone(),
+                    voice: ic.realtime_voice.clone(),
+                    fallback: ic.realtime_fallback,
+                })
+            } else {
+                None
+            };
         channels.push(ConfiguredChannel {
             display_name: "Inkbox",
             alias: Some(alias.clone()),

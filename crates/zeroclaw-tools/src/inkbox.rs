@@ -19,7 +19,7 @@ use inkbox::contacts::resources::contacts::{
 use inkbox::contacts::types::{ContactEmail, ContactPhone};
 use inkbox::phone::resources::texts::TextRecipients;
 use inkbox::{AgentIdentity, Inkbox, InkboxError};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use zeroclaw_api::attribution::ToolKind;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_api::tool_attribution;
@@ -34,14 +34,6 @@ struct InkboxCtx {
 impl InkboxCtx {
     /// Resolve the identity and run a blocking SDK closure on the blocking pool,
     /// rendering its JSON value as the tool output (or the error as a failure).
-    ///
-    /// # Arguments
-    /// * `f` - closure given the resolved `AgentIdentity`, returning the JSON to
-    ///   surface to the model.
-    ///
-    /// # Returns
-    /// A [`ToolResult`] — success with pretty-printed JSON, or a failure
-    /// carrying the SDK error string.
     async fn run<F>(&self, f: F) -> ToolResult
     where
         // `anyhow::Result` keeps the `Err` variant small (a thin boxed pointer);
@@ -58,8 +50,7 @@ impl InkboxCtx {
         match joined {
             Ok(Ok(value)) => ToolResult {
                 success: true,
-                output: serde_json::to_string_pretty(&value)
-                    .unwrap_or_else(|_| value.to_string()),
+                output: serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
                 error: None,
             },
             Ok(Err(e)) => fail(e.to_string()),
@@ -148,23 +139,59 @@ fn fail(msg: impl Into<String>) -> ToolResult {
 /// Write single-use outbound-call context to the shared temp dir the channel's
 /// voice handler reads (`realtime::load_call_meta`), returning the token to
 /// append to the call WS URL as `context_token`.
-fn write_call_context(to_number: &str, purpose: Option<&str>, opening: Option<&str>) -> Option<String> {
+fn write_call_context(
+    to_number: &str,
+    purpose: Option<&str>,
+    opening: Option<&str>,
+) -> Option<String> {
     let token = uuid::Uuid::new_v4().to_string();
     let dir = std::env::temp_dir().join("inkbox_call_contexts");
-    std::fs::create_dir_all(&dir).ok()?;
     let body = json!({
         "to_number": to_number,
         "purpose": purpose.unwrap_or(""),
         "opening_message": opening.unwrap_or(""),
     });
-    std::fs::write(dir.join(format!("{token}.json")), body.to_string()).ok()?;
+    let write = || -> std::io::Result<()> {
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{token}.json"));
+        // The body carries the call's purpose/opening text; restrict it to the
+        // owner (0600) on Unix so other local users on a shared host can't read it.
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)?;
+            f.write_all(body.to_string().as_bytes())?;
+        }
+        #[cfg(not(unix))]
+        std::fs::write(&path, body.to_string())?;
+        Ok(())
+    };
+    if let Err(e) = write() {
+        // Surface the failure: the call still places, but without its purpose/
+        // opening — better to know than to silently drop the agent's intent.
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+            format!(
+                "[inkbox] could not write call-context file; call will lack purpose/opening: {e}"
+            ),
+        );
+        return None;
+    }
     Some(token)
 }
 
 // ── tools ────────────────────────────────────────────────────────────────
 
 /// `inkbox_whoami` — report the configured identity's channels.
-pub struct InkboxWhoami {
+pub(crate) struct InkboxWhoami {
     ctx: Arc<InkboxCtx>,
 }
 
@@ -199,7 +226,7 @@ impl Tool for InkboxWhoami {
 tool_attribution!(InkboxWhoami, ToolKind::Plugin);
 
 /// `inkbox_send_email` — send mail from the identity's mailbox.
-pub struct InkboxSendEmail {
+pub(crate) struct InkboxSendEmail {
     ctx: Arc<InkboxCtx>,
 }
 
@@ -256,7 +283,7 @@ impl Tool for InkboxSendEmail {
 tool_attribution!(InkboxSendEmail, ToolKind::Plugin);
 
 /// `inkbox_send_sms` — send an SMS/MMS from the identity's phone number.
-pub struct InkboxSendSms {
+pub(crate) struct InkboxSendSms {
     ctx: Arc<InkboxCtx>,
 }
 
@@ -310,7 +337,7 @@ impl Tool for InkboxSendSms {
 tool_attribution!(InkboxSendSms, ToolKind::Plugin);
 
 /// `inkbox_send_imessage` — send an iMessage from the identity.
-pub struct InkboxSendImessage {
+pub(crate) struct InkboxSendImessage {
     ctx: Arc<InkboxCtx>,
 }
 
@@ -369,7 +396,7 @@ impl Tool for InkboxSendImessage {
 tool_attribution!(InkboxSendImessage, ToolKind::Plugin);
 
 /// `inkbox_place_call` — place an outbound call, bridged to the agent's voice WS.
-pub struct InkboxPlaceCall {
+pub(crate) struct InkboxPlaceCall {
     ctx: Arc<InkboxCtx>,
 }
 
@@ -414,15 +441,15 @@ impl Tool for InkboxPlaceCall {
                 });
                 // Port call context (purpose/opening) to the realtime bridge via
                 // a single-use token file the voice handler reads on connect.
-                if ws.is_some() && (purpose.is_some() || opening.is_some()) {
-                    if let Some(token) =
-                        write_call_context(&to_number, purpose.as_deref(), opening.as_deref())
-                    {
-                        ws = ws.map(|u| {
-                            let sep = if u.contains('?') { '&' } else { '?' };
-                            format!("{u}{sep}context_token={token}")
-                        });
-                    }
+                let want_context = ws.is_some() && (purpose.is_some() || opening.is_some());
+                if let Some(token) = want_context
+                    .then(|| write_call_context(&to_number, purpose.as_deref(), opening.as_deref()))
+                    .flatten()
+                {
+                    ws = ws.map(|u| {
+                        let sep = if u.contains('?') { '&' } else { '?' };
+                        format!("{u}{sep}context_token={token}")
+                    });
                 }
                 let call = id.place_call(&to_number, ws.as_deref())?;
                 Ok(serde_json::to_value(call)?)
@@ -433,7 +460,7 @@ impl Tool for InkboxPlaceCall {
 tool_attribution!(InkboxPlaceCall, ToolKind::Plugin);
 
 /// `inkbox_list_text_conversations` — triage SMS/MMS threads.
-pub struct InkboxListTextConversations {
+pub(crate) struct InkboxListTextConversations {
     ctx: Arc<InkboxCtx>,
 }
 
@@ -472,7 +499,7 @@ impl Tool for InkboxListTextConversations {
 tool_attribution!(InkboxListTextConversations, ToolKind::Plugin);
 
 /// `inkbox_list_imessage_conversations` — triage iMessage threads.
-pub struct InkboxListImessageConversations {
+pub(crate) struct InkboxListImessageConversations {
     ctx: Arc<InkboxCtx>,
 }
 
@@ -509,7 +536,7 @@ impl Tool for InkboxListImessageConversations {
 tool_attribution!(InkboxListImessageConversations, ToolKind::Plugin);
 
 /// `inkbox_get_text_conversation` — read an SMS/MMS thread.
-pub struct InkboxGetTextConversation {
+pub(crate) struct InkboxGetTextConversation {
     ctx: Arc<InkboxCtx>,
 }
 
@@ -551,7 +578,7 @@ impl Tool for InkboxGetTextConversation {
 tool_attribution!(InkboxGetTextConversation, ToolKind::Plugin);
 
 /// `inkbox_get_imessage_conversation` — read an iMessage thread.
-pub struct InkboxGetImessageConversation {
+pub(crate) struct InkboxGetImessageConversation {
     ctx: Arc<InkboxCtx>,
 }
 
@@ -591,7 +618,7 @@ impl Tool for InkboxGetImessageConversation {
 tool_attribution!(InkboxGetImessageConversation, ToolKind::Plugin);
 
 /// `inkbox_list_emails` — list inbox messages for triage.
-pub struct InkboxListEmails {
+pub(crate) struct InkboxListEmails {
     ctx: Arc<InkboxCtx>,
 }
 
@@ -626,7 +653,7 @@ impl Tool for InkboxListEmails {
 tool_attribution!(InkboxListEmails, ToolKind::Plugin);
 
 /// `inkbox_get_email` — read one email with its full body.
-pub struct InkboxGetEmail {
+pub(crate) struct InkboxGetEmail {
     ctx: Arc<InkboxCtx>,
 }
 
@@ -663,7 +690,7 @@ impl Tool for InkboxGetEmail {
 tool_attribution!(InkboxGetEmail, ToolKind::Plugin);
 
 /// `inkbox_lookup_contact` — find a contact by email or phone.
-pub struct InkboxLookupContact {
+pub(crate) struct InkboxLookupContact {
     ctx: Arc<InkboxCtx>,
 }
 
@@ -694,9 +721,9 @@ impl Tool for InkboxLookupContact {
         Ok(self
             .ctx
             .run_client(move |c| {
-                let found = c
-                    .contacts()
-                    .lookup(email.as_deref(), None, None, phone.as_deref(), None)?;
+                let found =
+                    c.contacts()
+                        .lookup(email.as_deref(), None, None, phone.as_deref(), None)?;
                 Ok(serde_json::to_value(found)?)
             })
             .await)
@@ -705,7 +732,7 @@ impl Tool for InkboxLookupContact {
 tool_attribution!(InkboxLookupContact, ToolKind::Plugin);
 
 /// `inkbox_list_contacts` — list/search the org address book.
-pub struct InkboxListContacts {
+pub(crate) struct InkboxListContacts {
     ctx: Arc<InkboxCtx>,
 }
 
@@ -744,7 +771,7 @@ impl Tool for InkboxListContacts {
 tool_attribution!(InkboxListContacts, ToolKind::Plugin);
 
 /// `inkbox_create_contact` — add a contact to the org address book.
-pub struct InkboxCreateContact {
+pub(crate) struct InkboxCreateContact {
     ctx: Arc<InkboxCtx>,
 }
 
@@ -773,12 +800,20 @@ impl Tool for InkboxCreateContact {
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
         let emails = opt_list(&args, "emails").map(|v| {
             v.into_iter()
-                .map(|value| ContactEmail { label: None, value, is_primary: false })
+                .map(|value| ContactEmail {
+                    label: None,
+                    value,
+                    is_primary: false,
+                })
                 .collect::<Vec<_>>()
         });
         let phones = opt_list(&args, "phones").map(|v| {
             v.into_iter()
-                .map(|value| ContactPhone { label: None, value, is_primary: false })
+                .map(|value| ContactPhone {
+                    label: None,
+                    value,
+                    is_primary: false,
+                })
                 .collect::<Vec<_>>()
         });
         let params = CreateContactParams {
@@ -800,7 +835,7 @@ impl Tool for InkboxCreateContact {
 tool_attribution!(InkboxCreateContact, ToolKind::Plugin);
 
 /// `inkbox_update_contact` — edit fields on an existing contact.
-pub struct InkboxUpdateContact {
+pub(crate) struct InkboxUpdateContact {
     ctx: Arc<InkboxCtx>,
 }
 
@@ -848,7 +883,7 @@ impl Tool for InkboxUpdateContact {
 tool_attribution!(InkboxUpdateContact, ToolKind::Plugin);
 
 /// `inkbox_delete_contact` — remove a contact by id.
-pub struct InkboxDeleteContact {
+pub(crate) struct InkboxDeleteContact {
     ctx: Arc<InkboxCtx>,
 }
 
@@ -899,7 +934,30 @@ pub fn build_inkbox_tools(api_key: &str, identity: &str, base_url: &str) -> Vec<
     let built = std::thread::spawn(move || Inkbox::builder(key).base_url(base).build()).join();
     let client = match built {
         Ok(Ok(client)) => client,
-        _ => return Vec::new(),
+        // A build failure means this identity gets ZERO tools — log it so the
+        // operator can see why (bad base URL / key) instead of silent absence.
+        Ok(Err(e)) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                format!(
+                    "[inkbox] could not build client for identity {identity:?}; no tools registered: {e}"
+                ),
+            );
+            return Vec::new();
+        }
+        Err(_) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                format!(
+                    "[inkbox] client-build thread panicked for identity {identity:?}; no tools registered"
+                ),
+            );
+            return Vec::new();
+        }
     };
     let ctx = Arc::new(InkboxCtx {
         client,
@@ -924,4 +982,81 @@ pub fn build_inkbox_tools(api_key: &str, identity: &str, base_url: &str) -> Vec<
         Arc::new(InkboxDeleteContact { ctx }),
     ];
     tools
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn str_arg_filters_empty_and_non_strings() {
+        let v = json!({ "a": "x", "b": "", "c": 3 });
+        assert_eq!(str_arg(&v, "a").as_deref(), Some("x"));
+        assert_eq!(str_arg(&v, "b"), None);
+        assert_eq!(str_arg(&v, "c"), None);
+        assert_eq!(str_arg(&v, "missing"), None);
+    }
+
+    #[test]
+    fn str_list_handles_string_array_and_drops_empties() {
+        assert_eq!(
+            str_list(&json!({ "k": "one" }), "k"),
+            vec!["one".to_string()]
+        );
+        assert_eq!(
+            str_list(&json!({ "k": ["a", "", "b"] }), "k"),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(str_list(&json!({ "k": "" }), "k").is_empty());
+        assert!(str_list(&json!({}), "k").is_empty());
+    }
+
+    #[test]
+    fn opt_list_is_none_when_empty() {
+        assert_eq!(
+            opt_list(&json!({ "k": ["a"] }), "k"),
+            Some(vec!["a".to_string()])
+        );
+        assert_eq!(opt_list(&json!({ "k": [] }), "k"), None);
+    }
+
+    #[test]
+    fn int_and_bool_args_fall_back_to_defaults() {
+        assert_eq!(int_arg(&json!({ "n": 5 }), "n", 1), 5);
+        assert_eq!(int_arg(&json!({}), "n", 1), 1);
+        assert!(bool_arg(&json!({ "b": true }), "b", false));
+        assert!(!bool_arg(&json!({}), "b", false));
+    }
+
+    #[test]
+    fn text_recipients_parses_one_and_many() {
+        assert!(matches!(
+            text_recipients(&json!({ "to": "+15551230000" })),
+            Some(TextRecipients::One(_))
+        ));
+        assert!(matches!(
+            text_recipients(&json!({ "to": ["+1", "+2"] })),
+            Some(TextRecipients::Many(_))
+        ));
+        assert!(text_recipients(&json!({ "to": "" })).is_none());
+        assert!(text_recipients(&json!({})).is_none());
+    }
+
+    #[test]
+    fn write_call_context_writes_owner_only_file_with_body() {
+        let token = write_call_context("+15551230000", Some("confirm order"), None).expect("token");
+        let path = std::env::temp_dir()
+            .join("inkbox_call_contexts")
+            .join(format!("{token}.json"));
+        assert!(path.exists());
+        let body: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(body["purpose"], "confirm order");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
 }
