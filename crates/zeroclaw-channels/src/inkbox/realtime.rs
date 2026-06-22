@@ -9,12 +9,12 @@
 //!   `input_audio_buffer.append` / `response.output_audio.delta`),
 //! * handles barge-in (`input_audio_buffer.speech_started` → `clear`),
 //! * exposes the realtime function tools the model can call mid-call:
-//!   `agent_consult` (pause and ask the main agent for tool work),
+//!   `consult_agent` (pause and ask the main agent for tool work),
 //!   `register/edit/delete_post_call_action`, and two-step `hang_up_call`,
 //! * accumulates the transcript, and on hangup dispatches either the queued
 //!   post-call actions or a `[call_ended]` reflection turn to the agent.
 //!
-//! `agent_consult` reuses the channel's reply path: the bridge emits a
+//! `consult_agent` reuses the channel's reply path: the bridge emits a
 //! `ChannelMessage` tagged `consult:<id>`, the agent answers, and
 //! [`InkboxChannel::send`](super::InkboxChannel) routes that answer back via
 //! [`deliver_consult`].
@@ -95,7 +95,7 @@ pub struct CallMeta {
 
 const OPENAI_REALTIME_URL: &str = "wss://api.openai.com/v1/realtime";
 const INPUT_TRANSCRIPTION_MODEL: &str = "gpt-4o-mini-transcribe";
-const CONSULT_TIMEOUT_SECS: u64 = 60;
+const CONSULT_TIMEOUT_SECS: u64 = 300;
 const HANGUP_CONFIRM_WINDOW_SECS: u64 = 60;
 /// After the confirmed `hang_up_call`, hold the carrier leg open briefly so the
 /// already-forwarded goodbye audio plays out before we send the hangup frame
@@ -111,7 +111,7 @@ fn consult_sinks() -> &'static Mutex<HashMap<String, oneshot::Sender<String>>> {
     CONSULT_SINKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Deliver the main agent's answer to a pending `agent_consult` so the realtime
+/// Deliver the main agent's answer to a pending `consult_agent` so the realtime
 /// model can read it back. Called by [`InkboxChannel::send`](super::InkboxChannel)
 /// for `consult:<id>` reply targets. Returns `false` if the consult expired.
 pub(super) fn deliver_consult(id: &str, answer: &str) -> bool {
@@ -145,7 +145,7 @@ pub(super) fn load_call_meta(context_token: Option<&str>) -> CallMeta {
 // ── instructions / greeting / session ──────────────────────────────────────
 
 /// Port of hermes `build_realtime_instructions`, adapted to ZeroClaw identity
-/// and first-person `agent_consult` (it's the same agent, not a handoff).
+/// and first-person `consult_agent` (it's the same agent, not a handoff).
 fn build_instructions(meta: &CallMeta) -> String {
     let name = if meta.agent_handle.is_empty() {
         "ZeroClaw".to_string()
@@ -216,7 +216,7 @@ fn build_instructions(meta: &CallMeta) -> String {
          lookup or checking context."
             .to_string(),
         "If the caller asks for work to happen now during the live call and it needs your tools, \
-         call agent_consult. This includes sending SMS/email, reading SMS/email/call history, \
+         call consult_agent. This includes sending SMS/email, reading SMS/email/call history, \
          creating notes, updating contacts, or checking current data. It is YOU doing the work \
          with your own tools, not a handoff to anyone else."
             .to_string(),
@@ -228,7 +228,7 @@ fn build_instructions(meta: &CallMeta) -> String {
          edit_post_call_action or delete_post_call_action using the action index returned when \
          the work was queued."
             .to_string(),
-        "If agent_consult completes or queues work that matches a previously registered after-call \
+        "If consult_agent completes or queues work that matches a previously registered after-call \
          action, call delete_post_call_action for that action so it is not executed twice after \
          hangup."
             .to_string(),
@@ -236,7 +236,7 @@ fn build_instructions(meta: &CallMeta) -> String {
          call hang_up_call. The first call arms hangup and asks you to say goodbye; after the \
          goodbye, call it once more to end the phone call."
             .to_string(),
-        "Do not call agent_consult for greetings, caller identity at call start, or generic chat."
+        "Do not call consult_agent for greetings, caller identity at call start, or generic chat."
             .to_string(),
     ]);
     lines.join("\n")
@@ -277,7 +277,7 @@ fn realtime_tools() -> Value {
     json!([
         {
             "type": "function",
-            "name": "agent_consult",
+            "name": "consult_agent",
             "description": "Do work that needs your tools — look up or send an email/text, check or save a contact, recall something from memory, hit an API, or compute. Briefly pauses the call, does the work with your full toolset, and returns the answer for you to read back. This is YOU doing the work, not a handoff to anyone. Use whenever the caller needs current data, memory, or an action; never for greetings or small talk.",
             "parameters": {
                 "type": "object",
@@ -857,7 +857,7 @@ pub(super) async fn run_realtime_bridge(
                         let args: Value = serde_json::from_str(&pc.args).unwrap_or_else(|_| json!({}));
                         let mut send_output = true;
                         let output: Value = match pc.name.as_str() {
-                            "agent_consult" => {
+                            "consult_agent" => {
                                 send_output = false; // the spawned task posts the output
                                 dispatch_consult(&args, &pc.call_id, &tx, &alias, &meta, &out_tx);
                                 json!({})
@@ -957,7 +957,7 @@ pub(super) async fn run_realtime_bridge(
     );
 }
 
-/// Dispatch an `agent_consult`: emit the query as a `ChannelMessage` the agent
+/// Dispatch an `consult_agent`: emit the query as a `ChannelMessage` the agent
 /// answers, send the model an interim "one moment", and post the answer back as
 /// the tool output once it arrives (with a timeout).
 fn dispatch_consult(
