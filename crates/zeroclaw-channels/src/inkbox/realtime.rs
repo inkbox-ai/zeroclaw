@@ -20,22 +20,22 @@
 //! [`deliver_consult`].
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use zeroclaw_api::channel::ChannelMessage;
 
 /// Realtime bridge configuration, resolved from `[channels.inkbox.<alias>]`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RealtimeConfig {
     /// OpenAI API key (Bearer).
     pub api_key: String,
@@ -45,6 +45,18 @@ pub struct RealtimeConfig {
     pub voice: String,
     /// Fall back to Inkbox STT/TTS if the realtime bridge can't connect.
     pub fallback: bool,
+}
+
+// Hand-written so a stray `{:?}` can never print the OpenAI API key.
+impl std::fmt::Debug for RealtimeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RealtimeConfig")
+            .field("api_key", &"<redacted>")
+            .field("model", &self.model)
+            .field("voice", &self.voice)
+            .field("fallback", &self.fallback)
+            .finish()
+    }
 }
 
 impl RealtimeConfig {
@@ -58,8 +70,11 @@ impl RealtimeConfig {
 /// (from the outbound `context_token`) is threaded in the context increment.
 #[derive(Debug, Clone, Default)]
 pub struct CallMeta {
+    /// Inkbox call id (UUID string); empty on the STT/TTS path.
     pub call_id: String,
+    /// `"inbound"` or `"outbound"` — drives greeting/instruction wording.
     pub direction: String,
+    /// Resolved caller display name, when a contact matched.
     pub contact_name: Option<String>,
     /// The caller's full Inkbox contact card (every populated field), rendered
     /// for the model — so the agent can act on "send me an email" / "text my
@@ -72,7 +87,9 @@ pub struct CallMeta {
     /// Our own agent identity (resolved at call start) so the model speaks as
     /// ZeroClaw with the right contact details.
     pub agent_handle: String,
+    /// Our own email identity, when the agent has a mailbox.
     pub agent_email: Option<String>,
+    /// Our own phone number, when the agent has one.
     pub agent_phone: Option<String>,
 }
 
@@ -116,12 +133,23 @@ fn call_context_dir() -> std::path::PathBuf {
 /// token means an inbound call.
 pub(super) fn load_call_meta(context_token: Option<&str>) -> CallMeta {
     let Some(token) = context_token.map(str::trim).filter(|t| !t.is_empty()) else {
-        return CallMeta { direction: "inbound".into(), ..Default::default() };
+        return CallMeta {
+            direction: "inbound".into(),
+            ..Default::default()
+        };
     };
     let path = call_context_dir().join(format!("{token}.json"));
     let meta = match std::fs::read_to_string(&path) {
         Ok(s) => {
-            let v: Value = serde_json::from_str(&s).unwrap_or_else(|_| json!({}));
+            let v: Value = serde_json::from_str(&s).unwrap_or_else(|e| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    format!("[inkbox] corrupt call-context file for token {token}; ignoring: {e}"),
+                );
+                json!({})
+            });
             let pick = |k: &str| {
                 v.get(k)
                     .and_then(Value::as_str)
@@ -139,7 +167,10 @@ pub(super) fn load_call_meta(context_token: Option<&str>) -> CallMeta {
             }
         }
         // Token present but file gone: still an outbound call, just no context.
-        Err(_) => CallMeta { direction: "outbound".into(), ..Default::default() },
+        Err(_) => CallMeta {
+            direction: "outbound".into(),
+            ..Default::default()
+        },
     };
     let _ = std::fs::remove_file(&path);
     meta
@@ -171,7 +202,11 @@ fn build_instructions(meta: &CallMeta) -> String {
     if let Some(p) = meta.agent_phone.as_deref().filter(|p| !p.is_empty()) {
         lines.push(format!("Your phone number: {p}."));
     }
-    match meta.contact_name.as_deref().filter(|c| !c.is_empty() && *c != "caller") {
+    match meta
+        .contact_name
+        .as_deref()
+        .filter(|c| !c.is_empty() && *c != "caller")
+    {
         Some(c) => {
             lines.push(
                 "You already know who this is — do NOT look them up or ask for details you \
@@ -181,7 +216,11 @@ fn build_instructions(meta: &CallMeta) -> String {
             lines.push(format!("Caller name: {c}."));
             // The full contact card: every email/phone/address on file, so the
             // agent can act on "email me" / "text my other line" directly.
-            if let Some(card) = meta.contact_card.as_deref().filter(|s| !s.trim().is_empty()) {
+            if let Some(card) = meta
+                .contact_card
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+            {
                 lines.push(format!("Their full contact card:\n{card}"));
             }
         }
@@ -405,16 +444,16 @@ pub(super) async fn connect_openai(cfg: &RealtimeConfig) -> anyhow::Result<OpenA
     );
     let mut request = url
         .into_client_request()
-        .map_err(|e| anyhow::anyhow!("realtime: bad URL: {e}"))?;
+        .map_err(|e| anyhow::Error::msg(format!("realtime: bad URL: {e}")))?;
     request.headers_mut().insert(
         "Authorization",
         format!("Bearer {}", cfg.api_key)
             .parse()
-            .map_err(|e| anyhow::anyhow!("realtime: bad auth header: {e}"))?,
+            .map_err(|e| anyhow::Error::msg(format!("realtime: bad auth header: {e}")))?,
     );
     let (ws, _resp) = tokio_tungstenite::connect_async(request)
         .await
-        .map_err(|e| anyhow::anyhow!("realtime: OpenAI connect failed: {e}"))?;
+        .map_err(|e| anyhow::Error::msg(format!("realtime: OpenAI connect failed: {e}")))?;
     Ok(ws)
 }
 
@@ -423,13 +462,6 @@ struct PendingCall {
     call_id: String,
     name: String,
     args: String,
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// Best display name for a contact: preferred name, else the assembled
@@ -502,24 +534,38 @@ fn render_contact_card(c: &inkbox::contacts::types::Contact) -> String {
         _ => {}
     }
     if !c.emails.is_empty() {
-        let v: Vec<String> =
-            c.emails.iter().map(|e| tagged(&e.value, &e.label, e.is_primary)).collect();
+        let v: Vec<String> = c
+            .emails
+            .iter()
+            .map(|e| tagged(&e.value, &e.label, e.is_primary))
+            .collect();
         lines.push(format!("- Emails: {}", v.join("; ")));
     }
     if !c.phones.is_empty() {
-        let v: Vec<String> =
-            c.phones.iter().map(|p| tagged(&p.value, &p.label, p.is_primary)).collect();
+        let v: Vec<String> = c
+            .phones
+            .iter()
+            .map(|p| tagged(&p.value, &p.label, p.is_primary))
+            .collect();
         lines.push(format!("- Phones: {}", v.join("; ")));
     }
     if !c.websites.is_empty() {
-        let v: Vec<String> = c.websites.iter().map(|w| tagged(&w.value, &w.label, false)).collect();
+        let v: Vec<String> = c
+            .websites
+            .iter()
+            .map(|w| tagged(&w.value, &w.label, false))
+            .collect();
         lines.push(format!("- Websites: {}", v.join("; ")));
     }
     if let Some(b) = c.birthday.as_deref().filter(|s| !s.trim().is_empty()) {
         lines.push(format!("- Birthday: {b}"));
     }
     if !c.dates.is_empty() {
-        let v: Vec<String> = c.dates.iter().map(|d| tagged(&d.value, &d.label, false)).collect();
+        let v: Vec<String> = c
+            .dates
+            .iter()
+            .map(|d| tagged(&d.value, &d.label, false))
+            .collect();
         lines.push(format!("- Dates: {}", v.join("; ")));
     }
     for a in &c.addresses {
@@ -552,20 +598,34 @@ fn render_contact_card(c: &inkbox::contacts::types::Contact) -> String {
     lines.join("\n")
 }
 
+/// Everything the realtime bridge needs besides the two live sockets and the
+/// inbound-message sender: call config, seed metadata, and the SDK client +
+/// identity used to resolve the caller during setup.
+pub(super) struct BridgeSetup {
+    pub cfg: RealtimeConfig,
+    pub meta: CallMeta,
+    pub alias: String,
+    pub client: Arc<inkbox::Inkbox>,
+    pub identity: String,
+    pub call_id: String,
+}
+
 /// Run the realtime bridge between the (already-upgraded) Inkbox call-media
 /// WebSocket and the OpenAI Realtime API. Returns when either side closes.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_realtime_bridge(
+pub(super) async fn run_realtime_bridge(
     inkbox_ws: WebSocket,
     openai: OpenAiWs,
-    cfg: RealtimeConfig,
-    meta: CallMeta,
     tx: mpsc::Sender<ChannelMessage>,
-    alias: String,
-    client: Arc<inkbox::Inkbox>,
-    identity: String,
-    call_id: String,
+    setup: BridgeSetup,
 ) {
+    let BridgeSetup {
+        cfg,
+        meta,
+        alias,
+        client,
+        identity,
+        call_id,
+    } = setup;
     // Resolve (a) our own identity so the model speaks as ZeroClaw, and (b) the
     // CALLER's full contact card from the call record so the agent can act on
     // requests like "send me an email" / "text my other line" without asking
@@ -589,40 +649,72 @@ pub async fn run_realtime_bridge(
             let mut caller_name = None;
             let mut caller_card = None;
             let mut direction = String::new();
-            if !call_id.is_empty() {
-                if let Some(pid) = phone_id.as_deref() {
-                    if let Ok(call) = client.calls().get(pid, &call_id) {
-                        direction = call.direction;
-                        let remote = call.remote_phone_number;
-                        if !remote.is_empty() {
-                            if let Ok(found) =
-                                client.contacts().lookup(None, None, None, Some(&remote), None)
-                            {
-                                if let Some(c) = found.first() {
-                                    caller_name = contact_display_name(c);
-                                    caller_card = Some(render_contact_card(c));
+            if !call_id.is_empty() && let Some(pid) = phone_id.as_deref() {
+                // Surface SDK errors: a failed lookup here is the difference
+                // between "unknown caller" and "we couldn't reach Inkbox".
+                match client.calls().get(pid, &call_id) {
+                        Ok(call) => {
+                            direction = call.direction;
+                            let remote = call.remote_phone_number;
+                            if !remote.is_empty() {
+                                match client
+                                    .contacts()
+                                    .lookup(None, None, None, Some(&remote), None)
+                                {
+                                    Ok(found) => {
+                                        if let Some(c) = found.first() {
+                                            caller_name = contact_display_name(c);
+                                            caller_card = Some(render_contact_card(c));
+                                        }
+                                    }
+                                    Err(e) => ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                                        format!(
+                                            "[inkbox] caller contact lookup failed for call {call_id}: {e}"
+                                        ),
+                                    ),
                                 }
                             }
                         }
+                        Err(e) => ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                            format!("[inkbox] could not load call record {call_id}: {e}"),
+                        ),
                     }
-                }
             }
             (agent_handle, agent_email, agent_phone, caller_name, caller_card, direction)
         })
         .await;
-        if let Ok((ah, ae, ap, cn, card, dir)) = resolved {
-            meta.agent_handle = ah;
-            meta.agent_email = ae;
-            meta.agent_phone = ap;
-            if cn.is_some() {
-                meta.contact_name = cn;
+        match resolved {
+            Ok((ah, ae, ap, cn, card, dir)) => {
+                meta.agent_handle = ah;
+                meta.agent_email = ae;
+                meta.agent_phone = ap;
+                if cn.is_some() {
+                    meta.contact_name = cn;
+                }
+                if card.is_some() {
+                    meta.contact_card = card;
+                }
+                if !dir.is_empty() {
+                    meta.direction = dir;
+                }
             }
-            if card.is_some() {
-                meta.contact_card = card;
-            }
-            if !dir.is_empty() {
-                meta.direction = dir;
-            }
+            // The blocking task panicked — the model loses its identity + the
+            // caller's card; don't let that vanish silently.
+            Err(e) => ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                format!("[inkbox] call-setup resolution task failed: {e}"),
+            ),
         }
     }
     ::zeroclaw_log::record!(
@@ -638,7 +730,20 @@ pub async fn run_realtime_bridge(
     // tool outputs from async consult tasks) flows through this channel so the
     // sink has exactly one writer.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<WsMessage>();
-    if out_tx.send(WsMessage::Text(session_update(&cfg, &meta).to_string().into())).is_err() {
+    if out_tx
+        .send(WsMessage::Text(
+            session_update(&cfg, &meta).to_string().into(),
+        ))
+        .is_err()
+    {
+        // The writer is already gone before we configured the session — the
+        // call can't proceed; log so it isn't an invisible dead call.
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+            "[inkbox] realtime bridge aborted before session.update could be sent",
+        );
         return;
     }
 
@@ -749,28 +854,27 @@ pub async fn run_realtime_bridge(
                     }
                     // function-call streaming
                     Some("response.output_item.added") => {
-                        if let Some(item) = ev.get("item") {
-                            if item.get("type").and_then(Value::as_str) == Some("function_call") {
-                                if let (Some(id), Some(call_id), Some(name)) = (
-                                    item.get("id").and_then(Value::as_str),
-                                    item.get("call_id").and_then(Value::as_str),
-                                    item.get("name").and_then(Value::as_str),
-                                ) {
-                                    pending.insert(id.to_string(), PendingCall {
-                                        call_id: call_id.to_string(),
-                                        name: name.to_string(),
-                                        args: String::new(),
-                                    });
-                                }
-                            }
+                        if let Some(item) = ev.get("item")
+                            && item.get("type").and_then(Value::as_str) == Some("function_call")
+                            && let (Some(id), Some(call_id), Some(name)) = (
+                                item.get("id").and_then(Value::as_str),
+                                item.get("call_id").and_then(Value::as_str),
+                                item.get("name").and_then(Value::as_str),
+                            )
+                        {
+                            pending.insert(id.to_string(), PendingCall {
+                                call_id: call_id.to_string(),
+                                name: name.to_string(),
+                                args: String::new(),
+                            });
                         }
                     }
                     Some("response.function_call_arguments.delta") => {
                         if let (Some(id), Some(delta)) = (
                             ev.get("item_id").and_then(Value::as_str),
                             ev.get("delta").and_then(Value::as_str),
-                        ) {
-                            if let Some(p) = pending.get_mut(id) { p.args.push_str(delta); }
+                        ) && let Some(p) = pending.get_mut(id) {
+                            p.args.push_str(delta);
                         }
                     }
                     Some("response.function_call_arguments.done") => {
@@ -879,7 +983,11 @@ pub async fn run_realtime_bridge(
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-        format!("[inkbox] realtime call ended ({} transcript turns, {} post-call actions)", transcript.len(), post_call_actions.len()),
+        format!(
+            "[inkbox] realtime call ended ({} transcript turns, {} post-call actions)",
+            transcript.len(),
+            post_call_actions.len()
+        ),
     );
 }
 
@@ -894,9 +1002,17 @@ fn dispatch_consult(
     meta: &CallMeta,
     out_tx: &mpsc::UnboundedSender<WsMessage>,
 ) {
-    let query = args.get("query").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let query = args
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if query.is_empty() {
-        let _ = out_tx.send(function_call_output(call_id, &json!({ "error": "query is required" })));
+        let _ = out_tx.send(function_call_output(
+            call_id,
+            &json!({ "error": "query is required" }),
+        ));
         let _ = out_tx.send(response_create_empty());
         return;
     }
@@ -912,10 +1028,17 @@ fn dispatch_consult(
         format!("consult:{id}"),
         format!("[in-call consult] {query}"),
         "inkbox",
-        now_secs(),
+        super::now_secs(),
     );
     cm.channel_alias = Some(alias.to_string());
-    let _ = tx.try_send(cm);
+    if let Err(e) = tx.try_send(cm) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+            format!("[inkbox] dropped in-call consult dispatch: {e}"),
+        );
+    }
 
     // Interim acknowledgement so the caller isn't left in silence.
     let _ = out_tx.send(response_create_instructions(
@@ -924,11 +1047,19 @@ fn dispatch_consult(
 
     let out_tx = out_tx.clone();
     let call_id = call_id.to_string();
-    tokio::spawn(async move {
-        let answer = match tokio::time::timeout(Duration::from_secs(CONSULT_TIMEOUT_SECS), orx).await {
+    zeroclaw_spawn::spawn!(async move {
+        let answer = match tokio::time::timeout(Duration::from_secs(CONSULT_TIMEOUT_SECS), orx)
+            .await
+        {
             Ok(Ok(ans)) => ans,
             _ => {
                 consult_sinks().lock().remove(&id);
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    format!("[inkbox] in-call consult {id} timed out or got no answer; continuing"),
+                );
                 "I couldn't reach the assistant just now — let's continue.".to_string()
             }
         };
@@ -960,7 +1091,11 @@ fn dispatch_post_call(
 
     // The caller's full contact card, so the post-call turn knows exactly who
     // to email/text without re-resolving or asking.
-    let caller_block = match meta.contact_card.as_deref().filter(|s| !s.trim().is_empty()) {
+    let caller_block = match meta
+        .contact_card
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
         Some(card) => {
             let who = meta.contact_name.as_deref().unwrap_or("the caller");
             format!("\n\nCaller ({who}) contact card:\n{card}")
@@ -1021,8 +1156,142 @@ fn dispatch_post_call(
         reply_target,
         body,
         "inkbox",
-        now_secs(),
+        super::now_secs(),
     );
     cm.channel_alias = Some(alias.to_string());
-    let _ = tx.try_send(cm);
+    // A dropped post-call turn loses queued actions / the reflection — don't
+    // let that vanish silently.
+    if let Err(e) = tx.try_send(cm) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+            format!(
+                "[inkbox] dropped post-call dispatch for call {}: {e}",
+                meta.call_id
+            ),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inbound() -> CallMeta {
+        CallMeta {
+            direction: "inbound".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn realtime_usable_requires_enabled_and_a_key() {
+        assert!(RealtimeConfig::usable(true, "sk-123"));
+        assert!(!RealtimeConfig::usable(false, "sk-123")); // disabled
+        assert!(!RealtimeConfig::usable(true, "")); // no key
+        assert!(!RealtimeConfig::usable(true, "   ")); // whitespace-only key
+    }
+
+    #[test]
+    fn instructions_first_person_known_caller_with_card() {
+        let m = CallMeta {
+            agent_handle: "zero-claw".into(),
+            agent_email: Some("zero@inkbox.ai".into()),
+            contact_name: Some("Dima Vremenko".into()),
+            contact_card: Some("- Name: Dima Vremenko\n- Emails: dima@inkbox.ai".into()),
+            direction: "inbound".into(),
+            ..Default::default()
+        };
+        let s = build_instructions(&m);
+        assert!(s.contains("speak in the first person"));
+        assert!(s.contains("Caller name: Dima Vremenko."));
+        assert!(s.contains("Their full contact card:"));
+        assert!(s.contains("Your email identity: zero@inkbox.ai."));
+        assert!(!s.contains("No matching contact record"));
+    }
+
+    #[test]
+    fn instructions_unknown_caller_and_caller_sentinel() {
+        assert!(build_instructions(&inbound()).contains("No matching contact record is loaded"));
+        // the literal "caller" sentinel is treated as unknown
+        let m = CallMeta {
+            contact_name: Some("caller".into()),
+            ..inbound()
+        };
+        assert!(build_instructions(&m).contains("No matching contact record is loaded"));
+    }
+
+    #[test]
+    fn instructions_outbound_includes_purpose() {
+        let m = CallMeta {
+            direction: "outbound".into(),
+            purpose: Some("confirm the order".into()),
+            ..Default::default()
+        };
+        let s = build_instructions(&m);
+        assert!(s.contains("This is an outbound call you placed. Purpose: confirm the order"));
+        assert!(s.contains("do not open with a generic offer to help"));
+    }
+
+    #[test]
+    fn greeting_uses_first_name_inbound_else_there() {
+        let m = CallMeta {
+            contact_name: Some("Dima Vremenko".into()),
+            ..inbound()
+        };
+        assert!(build_greeting(&m).contains("Hi Dima,"));
+        assert!(build_greeting(&inbound()).contains("Hi there,"));
+    }
+
+    #[test]
+    fn greeting_outbound_prefers_opening_then_purpose() {
+        let opening = CallMeta {
+            direction: "outbound".into(),
+            opening: Some("Hi, calling about your appointment.".into()),
+            ..Default::default()
+        };
+        assert!(build_greeting(&opening).contains("Hi, calling about your appointment."));
+        let purpose = CallMeta {
+            direction: "outbound".into(),
+            purpose: Some("reschedule".into()),
+            ..Default::default()
+        };
+        assert!(build_greeting(&purpose).contains("explaining why you are calling"));
+    }
+
+    fn sample_contact() -> inkbox::contacts::types::Contact {
+        serde_json::from_value(json!({
+            "id": "00000000-0000-0000-0000-000000000001",
+            "preferred_name": "Dima",
+            "given_name": "Dima",
+            "family_name": "Vremenko",
+            "company_name": "Inkbox",
+            "job_title": "Cofounder",
+            "emails": [{ "value": "dima@inkbox.ai", "is_primary": true, "label": "work" }],
+            "phones": [{ "value_e164": "+15551230000", "is_primary": true, "label": "mobile" }],
+            "notes": "VIP",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .expect("valid contact json")
+    }
+
+    #[test]
+    fn contact_display_name_prefers_preferred_name() {
+        assert_eq!(
+            contact_display_name(&sample_contact()).as_deref(),
+            Some("Dima")
+        );
+    }
+
+    #[test]
+    fn render_contact_card_includes_all_populated_fields() {
+        let card = render_contact_card(&sample_contact());
+        assert!(card.contains("- Name: Dima Vremenko"));
+        assert!(card.contains("- Company: Inkbox (Cofounder)"));
+        assert!(card.contains("dima@inkbox.ai"));
+        assert!(card.contains("+15551230000"));
+        assert!(card.contains("- Notes: VIP"));
+    }
 }

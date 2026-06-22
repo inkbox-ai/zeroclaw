@@ -687,10 +687,18 @@ pub fn all_tools_with_runtime(
     }
 
     // Inkbox tools — registered for the first enabled inkbox identity so the
-    // agent can send/triage/call proactively (the channel handles inbound).
+    // agent can send/triage/call proactively (the channel handles inbound). The
+    // single-identity setup is the documented convention; iterate by alias so
+    // the pick is deterministic if more than one identity is enabled.
     #[cfg(feature = "inkbox-tools")]
     {
-        if let Some(ic) = root_config.channels.inkbox.values().find(|c| c.enabled) {
+        let mut aliases: Vec<&String> = root_config.channels.inkbox.keys().collect();
+        aliases.sort();
+        if let Some(ic) = aliases
+            .into_iter()
+            .filter_map(|a| root_config.channels.inkbox.get(a))
+            .find(|c| c.enabled)
+        {
             for tool in
                 zeroclaw_tools::inkbox::build_inkbox_tools(&ic.api_key, &ic.identity, &ic.base_url)
             {
