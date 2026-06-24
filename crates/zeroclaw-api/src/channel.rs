@@ -193,6 +193,8 @@ impl SendMessage {
 
 /// Core channel trait — implement for any messaging platform.
 ///
+const DEFAULT_TYPING_REFRESH_SECS: u64 = 4;
+
 /// Every `Channel` is `Attributable`: the orchestrator's spawn site opens
 /// `attribution_span!(&*ch)` so log emissions from within `listen()` / `send()`
 /// inherit `channel = <type>.<alias>` from the trait object's role + alias.
@@ -220,6 +222,11 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Stop any active typing indicator.
     async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Seconds between typing-indicator refreshes for this channel.
+    fn typing_refresh_secs(&self) -> u64 {
+        DEFAULT_TYPING_REFRESH_SECS
     }
 
     /// Whether this channel supports progressive message updates via draft edits.

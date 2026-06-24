@@ -25,6 +25,7 @@ pub use realtime::RealtimeConfig;
 /// Loopback host the tunnel forwards inbound traffic to. The SDK's
 /// `validate_forward_target` requires a literal loopback address.
 const FORWARD_HOST: &str = "127.0.0.1";
+const INKBOX_TYPING_REFRESH_SECS: u64 = 40;
 
 /// Seconds since the Unix epoch, for `ChannelMessage` timestamps. Shared by the
 /// inbound webhook + call-media handlers.
@@ -214,6 +215,10 @@ impl Attributable for InkboxChannel {
 impl Channel for InkboxChannel {
     fn name(&self) -> &str {
         "inkbox"
+    }
+
+    fn typing_refresh_secs(&self) -> u64 {
+        INKBOX_TYPING_REFRESH_SECS
     }
 
     /// Show a typing bubble while composing a reply — iMessage only (SMS/email

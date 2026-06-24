@@ -235,7 +235,6 @@ const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 300;
 const CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP: u64 = 4;
 const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
-const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
@@ -3827,7 +3826,7 @@ fn spawn_scoped_typing_task(
     cancellation_token: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     let stop_signal = cancellation_token;
-    let refresh_interval = Duration::from_secs(CHANNEL_TYPING_REFRESH_INTERVAL_SECS);
+    let refresh_interval = Duration::from_secs(channel.typing_refresh_secs());
     zeroclaw_spawn::spawn!(async move {
         let mut interval = tokio::time::interval(refresh_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
