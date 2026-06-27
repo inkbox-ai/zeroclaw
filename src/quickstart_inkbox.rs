@@ -165,9 +165,7 @@ fn offer_phone_for_existing(
 
 /// Self-signup branch: create a fresh identity, verify it, then offer a number.
 /// Returns `(api_key, handle, phone, did_provision)`.
-fn signup_flow(
-    base_url: &str,
-) -> anyhow::Result<Option<(String, String, Option<String>, bool)>> {
+fn signup_flow(base_url: &str) -> anyhow::Result<Option<(String, String, Option<String>, bool)>> {
     println!(
         "  {}",
         crate::t(
@@ -309,9 +307,7 @@ fn signup_flow(
 
 /// Paste-a-key branch: validate the key and confirm its bound identity.
 /// Returns `(api_key, handle, phone, did_provision)`.
-fn api_key_flow(
-    base_url: &str,
-) -> anyhow::Result<Option<(String, String, Option<String>, bool)>> {
+fn api_key_flow(base_url: &str) -> anyhow::Result<Option<(String, String, Option<String>, bool)>> {
     let Some(api_key) = password(&crate::t(
         "cli-quickstart-inkbox-paste-key",
         "Paste your Inkbox API key (ApiKey_…)",
