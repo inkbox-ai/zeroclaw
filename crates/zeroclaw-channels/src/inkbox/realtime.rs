@@ -629,7 +629,30 @@ pub(super) async fn run_realtime_bridge(
                                     Ok(found) => {
                                         if let Some(c) = found.first() {
                                             caller_name = contact_display_name(c);
-                                            caller_card = Some(render_contact_card(c));
+                                            // Reverse-lookup returns a summary (no emails/phones);
+                                            // fetch the full card by id, summary as fallback.
+                                            match client.contacts().get(&c.id.to_string()) {
+                                                Ok(full) => {
+                                                    caller_card = Some(render_contact_card(&full));
+                                                }
+                                                Err(e) => {
+                                                    ::zeroclaw_log::record!(
+                                                        WARN,
+                                                        ::zeroclaw_log::Event::new(
+                                                            module_path!(),
+                                                            ::zeroclaw_log::Action::Note
+                                                        )
+                                                        .with_outcome(
+                                                            ::zeroclaw_log::EventOutcome::Failure
+                                                        ),
+                                                        format!(
+                                                            "[inkbox] caller contact detail fetch failed for {}: {e}",
+                                                            c.id
+                                                        ),
+                                                    );
+                                                    caller_card = Some(render_contact_card(c));
+                                                }
+                                            }
                                         }
                                     }
                                     Err(e) => ::zeroclaw_log::record!(
