@@ -236,8 +236,8 @@ fn build_instructions(meta: &CallMeta) -> String {
          hangup."
             .to_string(),
         "If the caller asks to hang up, says goodbye, or the conversation is clearly complete, \
-         call hang_up_call. The first call arms hangup and asks you to say goodbye; after the \
-         goodbye, call it once more to end the phone call."
+         say a brief, natural goodbye and call hang_up_call. The call ends automatically once \
+         your goodbye finishes — you do not need to call it again."
             .to_string(),
         "Do not call consult_agent for greetings, caller identity at call start, or generic chat."
             .to_string(),
@@ -330,7 +330,7 @@ fn realtime_tools() -> Value {
         {
             "type": "function",
             "name": "hang_up_call",
-            "description": "End the live call. TWO-STEP: the first call does NOT hang up — it prompts you to say a short goodbye. After you've said goodbye, call it a second time to actually end the call. Use only when the caller asks to hang up, says goodbye, or the conversation is clearly complete.",
+            "description": "End the live call. Call this once when the caller asks to hang up, says goodbye, or the conversation is clearly complete: say a brief, natural goodbye and the call ends automatically once it plays. You do not need to call it twice.",
             "parameters": {
                 "type": "object",
                 "properties": { "reason": { "type": "string", "description": "Optional short reason for ending." } },
@@ -810,6 +810,18 @@ pub(super) async fn run_realtime_bridge(
                         let mut done = json!({ "event": "audio_done" });
                         if let Some(sid) = &stream_id { done["stream_id"] = json!(sid); }
                         let _ = ink_tx.send(Message::Text(done.to_string().into())).await;
+                        // Armed → this finished turn is the goodbye; end the call now
+                        // (don't wait for a second hang_up_call). Let it play, then stop.
+                        if hangup_armed_at.is_some() {
+                            tokio::time::sleep(Duration::from_secs(HANGUP_CLOSE_DELAY_SECS)).await;
+                            let mut stop = json!({ "event": "stop" });
+                            if !hangup_reason.is_empty() {
+                                stop["reason"] = json!(hangup_reason);
+                            }
+                            let _ = ink_tx.send(Message::Text(stop.to_string().into())).await;
+                            let _ = ink_tx.close().await;
+                            break;
+                        }
                     }
                     Some("input_audio_buffer.speech_started") => {
                         let _ = ink_tx.send(Message::Text(json!({ "event": "clear" }).to_string().into())).await;
@@ -933,7 +945,7 @@ pub(super) async fn run_realtime_bridge(
                                     json!({ "status": "hangup_requested", "message": "The call is ending now." })
                                 } else {
                                     hangup_armed_at = Some(Instant::now());
-                                    json!({ "status": "confirm_goodbye", "message": "Don't hang up yet. Say a brief, natural goodbye, then call hang_up_call again." })
+                                    json!({ "status": "confirm_goodbye", "message": "Say a brief, natural goodbye now; the call ends automatically once it plays." })
                                 }
                             }
                             other => json!({ "error": format!("unknown tool {other}") }),
