@@ -1,7 +1,7 @@
 # Inkbox
 
-[Inkbox](https://inkbox.ai) gives an agent its own communication identity — a real
-email mailbox, a phone number for SMS and voice, and iMessage — behind a single
+[Inkbox](https://inkbox.ai) gives an agent its own communication identity (a real
+email mailbox, a phone number for SMS and voice, and iMessage) behind a single
 hosted account. One `[channels.inkbox.<alias>]` instance binds the agent to one
 Inkbox identity and answers across every surface that identity exposes.
 
@@ -20,7 +20,7 @@ a laptop or a box behind NAT works without a reverse proxy.
 
 Unlike chat-platform channels, Inkbox does not gate senders through a per-channel
 [peer group](./peer-groups.md). Reachability is enforced server-side by Inkbox
-contact rules on the identity's mailbox and phone number — manage who can reach
+contact rules on the identity's mailbox and phone number: manage who can reach
 the agent from the Inkbox console, and anyone Inkbox admits is delivered to the
 gateway.
 
@@ -44,8 +44,8 @@ verification) or validates an Inkbox API key you already hold, then offers to
 provision a phone number, mint a webhook signing key, and enable OpenAI Realtime
 calls. It writes the `[channels.inkbox.<alias>]` block and binds it to the agent.
 
-To configure by hand instead, set the three essentials — an API key, the agent
-identity handle, and (recommended) a webhook signing key:
+To configure by hand instead, set the three essentials (an API key, the agent
+identity handle, and a recommended webhook signing key):
 
 ```toml
 [channels.inkbox.default]
