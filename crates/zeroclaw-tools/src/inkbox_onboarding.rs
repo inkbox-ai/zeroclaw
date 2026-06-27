@@ -5,11 +5,13 @@
 
 use std::sync::Arc;
 
+use inkbox::identities::types::Unset;
 use inkbox::whoami::types::{
     AUTH_SUBTYPE_API_KEY_AGENT_SCOPED_CLAIMED, AUTH_SUBTYPE_API_KEY_AGENT_SCOPED_UNCLAIMED,
     WhoamiResponse,
 };
 use inkbox::{Inkbox, InkboxError};
+use uuid::Uuid;
 
 /// Result of a successful self-signup: an unverified API key bound to a freshly
 /// created agent identity, plus its hosted mailbox.
@@ -232,4 +234,144 @@ pub fn create_signing_key(base_url: &str, api_key: &str) -> anyhow::Result<Strin
         client.create_signing_key()
     })?;
     Ok(sk.signing_key)
+}
+
+/// Check for an inbound `START` opt-in text; returns the sender's number once
+/// seen. Used to poll for the carrier SMS opt-in after provisioning a number.
+///
+/// # Arguments
+/// * `base_url` - Inkbox API base URL.
+/// * `api_key` - the key to act as.
+/// * `handle` - the agent handle whose number to inspect.
+///
+/// # Returns
+/// `Some(sender_number)` once an inbound `START` is seen, else `None`.
+pub fn check_sms_start(
+    base_url: &str,
+    api_key: &str,
+    handle: &str,
+) -> anyhow::Result<Option<String>> {
+    let (key, base, h) = (
+        api_key.to_string(),
+        base_url.to_string(),
+        handle.to_string(),
+    );
+    off_runtime(move || {
+        let client = Arc::new(Inkbox::builder(key).base_url(base).build()?);
+        let id = client.get_identity(&h)?;
+        let texts = id.list_texts(20, 0, None, None)?;
+        Ok(texts.into_iter().find_map(|t| {
+            let is_start = t
+                .text
+                .as_deref()
+                .is_some_and(|s| s.trim().eq_ignore_ascii_case("start"));
+            if t.direction.eq_ignore_ascii_case("inbound") && is_start {
+                t.remote_phone_number
+            } else {
+                None
+            }
+        }))
+    })
+}
+
+/// Enable shared-iMessage reachability on the identity.
+///
+/// # Arguments
+/// * `base_url` - Inkbox API base URL.
+/// * `api_key` - the key to act as.
+/// * `handle` - the agent handle to enable iMessage on.
+///
+/// # Returns
+/// `Ok(())` once iMessage is enabled.
+pub fn enable_imessage(base_url: &str, api_key: &str, handle: &str) -> anyhow::Result<()> {
+    let (key, base, h) = (
+        api_key.to_string(),
+        base_url.to_string(),
+        handle.to_string(),
+    );
+    off_runtime(move || {
+        let client = Arc::new(Inkbox::builder(key).base_url(base).build()?);
+        let id = client.get_identity(&h)?;
+        id.update(None, Unset::Omit, Unset::Omit, Some(true), None, None)
+    })
+}
+
+/// Fetch the iMessage router number and the `connect` command a phone texts it.
+///
+/// # Arguments
+/// * `base_url` - Inkbox API base URL.
+/// * `api_key` - the key to act as.
+///
+/// # Returns
+/// `(router_number, connect_command)`.
+pub fn imessage_connect_info(base_url: &str, api_key: &str) -> anyhow::Result<(String, String)> {
+    let (key, base) = (api_key.to_string(), base_url.to_string());
+    off_runtime(move || {
+        let client = Inkbox::builder(key).base_url(base).build()?;
+        let triage = client.imessages().get_triage_number()?;
+        Ok((triage.number, triage.connect_command))
+    })
+}
+
+/// Check for the first inbound iMessage; returns its conversation + sender once
+/// seen. Used to poll for the iPhone connect during onboarding.
+///
+/// # Arguments
+/// * `base_url` - Inkbox API base URL.
+/// * `api_key` - the key to act as.
+/// * `handle` - the agent handle to inspect.
+///
+/// # Returns
+/// `Some((conversation_id, sender_number))` once an inbound iMessage arrives.
+pub fn check_first_imessage(
+    base_url: &str,
+    api_key: &str,
+    handle: &str,
+) -> anyhow::Result<Option<(Uuid, String)>> {
+    let (key, base, h) = (
+        api_key.to_string(),
+        base_url.to_string(),
+        handle.to_string(),
+    );
+    off_runtime(move || {
+        let client = Arc::new(Inkbox::builder(key).base_url(base).build()?);
+        let id = client.get_identity(&h)?;
+        let msgs = id.list_imessages(None, 10, 0, None, None)?;
+        Ok(msgs
+            .into_iter()
+            .find(|m| m.direction.eq_ignore_ascii_case("inbound"))
+            .map(|m| (m.conversation_id, m.remote_number)))
+    })
+}
+
+/// Send a welcome iMessage into the freshly connected conversation.
+///
+/// # Arguments
+/// * `base_url` - Inkbox API base URL.
+/// * `api_key` - the key to act as.
+/// * `handle` - the agent handle that owns the conversation.
+/// * `conversation_id` - the conversation to reply into.
+/// * `text` - the welcome message body.
+///
+/// # Returns
+/// `Ok(())` once sent.
+pub fn send_imessage_welcome(
+    base_url: &str,
+    api_key: &str,
+    handle: &str,
+    conversation_id: Uuid,
+    text: &str,
+) -> anyhow::Result<()> {
+    let (key, base, h, body) = (
+        api_key.to_string(),
+        base_url.to_string(),
+        handle.to_string(),
+        text.to_string(),
+    );
+    off_runtime(move || {
+        let client = Arc::new(Inkbox::builder(key).base_url(base).build()?);
+        let id = client.get_identity(&h)?;
+        id.send_imessage(None, Some(&conversation_id), Some(&body), None, None)
+            .map(|_| ())
+    })
 }
