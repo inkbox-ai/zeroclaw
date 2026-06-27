@@ -268,46 +268,108 @@ fn api_key_flow(base_url: &str) -> anyhow::Result<Option<(String, String)>> {
         return Ok(None);
     }
 
-    match ob::key_scope(base_url, &api_key) {
-        Ok(ob::KeyScope::NotApiKey) => {
+    // Hermes parity: whoami validates + classifies the key, then we resolve the
+    // identity from the key — never by asking. Agent-scoped keys map to exactly
+    // one identity; admin keys list and let the operator pick.
+    let info = match ob::whoami_scope(base_url, &api_key) {
+        Ok(i) => i,
+        Err(err) => {
             eprintln!(
-                "  {}",
-                crate::t(
-                    "cli-quickstart-inkbox-not-api-key",
-                    "This credential is not an API key (JWTs are not supported here).",
-                )
+                "  {} {}",
+                crate::t("cli-quickstart-inkbox-whoami-failed", "whoami failed:"),
+                err
             );
             return Ok(None);
         }
-        Ok(_) => {}
+    };
+    if info.auth == ob::KeyAuth::NotApiKey {
+        eprintln!(
+            "  {}",
+            crate::t(
+                "cli-quickstart-inkbox-not-api-key",
+                "This wizard requires an API key, but the credential is a JWT.",
+            )
+        );
+        return Ok(None);
+    }
+    println!(
+        "  {} {}",
+        crate::t(
+            "cli-quickstart-inkbox-key-validated",
+            "✓ Key validated. Scope:",
+        ),
+        info.subtype
+    );
+
+    let handles = match ob::list_identity_handles(base_url, &api_key) {
+        Ok(h) => h,
         Err(err) => {
             eprintln!(
                 "  {} {}",
                 crate::t(
-                    "cli-quickstart-inkbox-whoami-failed",
-                    "could not validate the key:",
+                    "cli-quickstart-inkbox-list-failed",
+                    "could not list identities:",
                 ),
                 err
             );
             return Ok(None);
         }
-    }
-
-    let Some(handle) = input(
-        &crate::t(
-            "cli-quickstart-inkbox-which-handle",
-            "Agent identity handle this gateway runs as",
-        ),
-        None,
-        false,
-    )?
-    else {
-        return Ok(None);
     };
-    let handle = handle.trim().to_string();
-    if handle.is_empty() {
+    if handles.is_empty() {
+        eprintln!(
+            "  {}",
+            crate::t(
+                "cli-quickstart-inkbox-no-identities",
+                "Key valid, but it sees no agent identities.",
+            )
+        );
         return Ok(None);
     }
+    let handle = match info.auth {
+        // Agent-scoped: bound to one identity — use it (warn if the API ever
+        // returns more), exactly like Hermes `_pick_agent_scoped`.
+        ob::KeyAuth::AgentScoped => {
+            if handles.len() > 1 {
+                eprintln!(
+                    "  {} {} {}",
+                    crate::t(
+                        "cli-quickstart-inkbox-agent-multi-a",
+                        "Agent-scoped key returned",
+                    ),
+                    handles.len(),
+                    crate::t(
+                        "cli-quickstart-inkbox-agent-multi-b",
+                        "identities; using the first.",
+                    ),
+                );
+            }
+            println!(
+                "  {} {}",
+                crate::t(
+                    "cli-quickstart-inkbox-bound",
+                    "This API key is bound to identity:",
+                ),
+                handles[0]
+            );
+            handles[0].clone()
+        }
+        // Admin-scoped: pick from the org's identities (Hermes `_pick_admin_scoped`).
+        _ => {
+            let Some(idx) = dialoguer::FuzzySelect::new()
+                .with_prompt(crate::t(
+                    "cli-quickstart-inkbox-pick-identity",
+                    "Select the identity this gateway runs as",
+                ))
+                .items(&handles)
+                .default(0)
+                .max_length(handles.len().max(1))
+                .interact_opt()?
+            else {
+                return Ok(None);
+            };
+            handles[idx].clone()
+        }
+    };
 
     match ob::fetch_identity(base_url, &api_key, &handle) {
         Ok(id) => {

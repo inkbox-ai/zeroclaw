@@ -25,20 +25,6 @@ pub struct Signup {
     pub email_address: String,
 }
 
-/// Where a pasted API key sits in the Inkbox auth model.
-#[derive(Debug, Clone)]
-pub enum KeyScope {
-    /// Admin-scoped key — can manage many identities under the org.
-    Admin,
-    /// Key already scoped to a single agent identity.
-    Agent {
-        /// Whether the agent has been claimed by a human.
-        claimed: bool,
-    },
-    /// A non-API-key credential (e.g. a JWT) — unusable for a gateway.
-    NotApiKey,
-}
-
 /// Minimal identity view the wizard needs to confirm a key works and to surface
 /// the agent's mailbox / phone in the summary.
 #[derive(Debug, Clone)]
@@ -141,15 +127,38 @@ pub fn resend(base_url: &str, api_key: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Classify a pasted API key so the wizard can branch (admin vs agent).
+/// How a pasted key authenticates, from `whoami` — mirrors the Hermes wizard's
+/// branch on `auth_subtype`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyAuth {
+    /// Agent-scoped key — bound to exactly one identity.
+    AgentScoped,
+    /// Admin-scoped (or unrecognised api-key subtype) — sees many identities.
+    AdminScoped,
+    /// A non-API-key credential (a JWT) — unusable for a gateway.
+    NotApiKey,
+}
+
+/// Result of `whoami` the wizard needs to classify a pasted key.
+#[derive(Debug, Clone)]
+pub struct WhoamiInfo {
+    /// Auth classification used to branch (agent vs admin vs JWT).
+    pub auth: KeyAuth,
+    /// Raw `auth_subtype` string (e.g. `api_key.agent_scoped.claimed`).
+    pub subtype: String,
+    /// The caller's organization id.
+    pub organization_id: String,
+}
+
+/// Call `whoami` to validate a pasted key and classify it (Hermes parity).
 ///
 /// # Arguments
 /// * `base_url` - Inkbox API base URL.
 /// * `api_key` - the key to inspect.
 ///
 /// # Returns
-/// The key's [`KeyScope`].
-pub fn key_scope(base_url: &str, api_key: &str) -> anyhow::Result<KeyScope> {
+/// A [`WhoamiInfo`] with the auth classification, raw subtype, and org id.
+pub fn whoami_scope(base_url: &str, api_key: &str) -> anyhow::Result<WhoamiInfo> {
     let (key, base) = (api_key.to_string(), base_url.to_string());
     let who = off_runtime(move || {
         let client = Inkbox::builder(key).base_url(base).build()?;
@@ -157,18 +166,45 @@ pub fn key_scope(base_url: &str, api_key: &str) -> anyhow::Result<KeyScope> {
     })?;
     Ok(match who {
         WhoamiResponse::ApiKey(k) => {
-            let sub = k.auth_subtype.as_deref().unwrap_or_default();
-            if sub == AUTH_SUBTYPE_API_KEY_AGENT_SCOPED_CLAIMED {
-                KeyScope::Agent { claimed: true }
-            } else if sub == AUTH_SUBTYPE_API_KEY_AGENT_SCOPED_UNCLAIMED {
-                KeyScope::Agent { claimed: false }
+            let subtype = k.auth_subtype.unwrap_or_default();
+            let auth = if subtype == AUTH_SUBTYPE_API_KEY_AGENT_SCOPED_CLAIMED
+                || subtype == AUTH_SUBTYPE_API_KEY_AGENT_SCOPED_UNCLAIMED
+            {
+                KeyAuth::AgentScoped
             } else {
-                // Admin-scoped, or any unrecognised api-key subtype → admin.
-                KeyScope::Admin
+                // Admin-scoped, or any unrecognised api-key subtype → list path.
+                KeyAuth::AdminScoped
+            };
+            WhoamiInfo {
+                auth,
+                subtype,
+                organization_id: k.organization_id.unwrap_or_default(),
             }
         }
-        WhoamiResponse::Jwt(_) => KeyScope::NotApiKey,
+        WhoamiResponse::Jwt(j) => WhoamiInfo {
+            auth: KeyAuth::NotApiKey,
+            subtype: "jwt".to_string(),
+            organization_id: j.organization_id.unwrap_or_default(),
+        },
     })
+}
+
+/// List the agent handles a key can see (one for an agent-scoped key, many for
+/// an admin key). Mirrors Hermes's `list_identities()` use in the key flow.
+///
+/// # Arguments
+/// * `base_url` - Inkbox API base URL.
+/// * `api_key` - the key to act as.
+///
+/// # Returns
+/// The visible agent handles.
+pub fn list_identity_handles(base_url: &str, api_key: &str) -> anyhow::Result<Vec<String>> {
+    let (key, base) = (api_key.to_string(), base_url.to_string());
+    let ids = off_runtime(move || {
+        let client = Inkbox::builder(key).base_url(base).build()?;
+        client.list_identities()
+    })?;
+    Ok(ids.into_iter().map(|s| s.agent_handle).collect())
 }
 
 /// Validate a key against a specific handle and fetch the agent's mailbox/phone.
