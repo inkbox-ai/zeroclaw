@@ -101,7 +101,7 @@ const CONSULT_TIMEOUT_SECS: u64 = 300;
 const HANGUP_CONFIRM_WINDOW_SECS: u64 = 60;
 /// After the confirmed `hang_up_call`, hold the carrier leg open briefly so the
 /// already-forwarded goodbye audio plays out before we send the hangup frame
-/// and close the socket (port of the Claude Code plugin's `HANGUP_CLOSE_DELAY_S`).
+/// and close the socket.
 const HANGUP_CLOSE_DELAY_SECS: u64 = 2;
 
 // ── consult reply registry ────────────────────────────────────────────────
@@ -837,8 +837,7 @@ pub(super) async fn run_realtime_bridge(
                             // Realtime runs raw-audio, so Inkbox does no STT and would
                             // record nothing. Mirror each finalized turn back as a
                             // `transcript` frame so it lands in the Inkbox call record
-                            // (party: local=agent, remote=caller). Ported from the
-                            // Claude Code plugin's `_relay_transcript`.
+                            // (party: local=agent, remote=caller).
                             let f = json!({ "event": "transcript", "party": "local", "text": t, "is_final": true });
                             let _ = ink_tx.send(Message::Text(f.to_string().into())).await;
                         }
