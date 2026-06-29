@@ -2927,6 +2927,7 @@ async fn handle_webhook(
                     channel: Some(channel_name.to_string()),
                     agent_alias: agent_alias.map(|s| s.to_string()),
                     turn_id: Some(turn_id.clone()),
+                    messages: None,
                 },
             );
             state.observer.record_metric(
@@ -2964,6 +2965,7 @@ async fn handle_webhook(
                     channel: Some(channel_name.to_string()),
                     agent_alias: agent_alias.map(|s| s.to_string()),
                     turn_id: Some(turn_id.clone()),
+                    messages: None,
                 },
             );
             state.observer.record_metric(
