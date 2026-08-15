@@ -51,7 +51,7 @@ jobs:
         with:
           toolchain: 1.96.1
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04bbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         if: steps.credentials.outputs.ready == 'true'
         with:
           cache-on-failure: true
