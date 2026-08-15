@@ -12,7 +12,7 @@ ignore = [
     # lru -- panic-safety issue requires a key with a panicking Drop impl plus
     # catch_unwind. ZeroClaw caches use non-panicking owned keys; 0.16 is also
     # pinned transitively by ratatui-core. Upgrade when the UI stack permits it.
-    { id = "RUSTSEC-2026-0253", reason = "lru pop panic-safety issue requires panicking key Drop under catch_unwind; ZeroClaw uses non-panicking owned keys and ratatui-core pins 0.16; awaiting UI dependency upgrade" },
+    { id = "RUSTSEC-2026-0253", reason = "lru pop panic-safety issue requires panicking key Drop under catch_unwind; ZeroClaw uses non-panicking owned keys and ratatui-core pins 0.16; awaiting UI dependency upgrade; tracking #8519" },
     # bincode -- unmaintained advisory (informational only, no CVE); team ceased
     # development after a doxxing/harassment incident; advisory affects all
     # versions including 2.x. In our tree, bincode is pulled in only via

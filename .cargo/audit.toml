@@ -7,6 +7,7 @@ ignore = [
     # Tracking: new ignores need a tracking issue URL reference.
     # Each entry below mirrors the `reason` field in deny.toml.
     # When a fix lands, remove from BOTH files.
+    "RUSTSEC-2026-0253",  # lru pop panic-safety issue requires panicking key Drop under catch_unwind; ZeroClaw uses non-panicking owned keys and ratatui-core pins 0.16; awaiting UI dependency upgrade; tracking #8519
     "RUSTSEC-2025-0141",  # bincode unmaintained (informational, no CVE); transitive via probe-rs `builtin-targets`; behind optional `probe` feature; awaiting probe-rs upstream serialization migration
     "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained; transitive dep awaiting upstream migration to rustls-pki-types
     "RUSTSEC-2026-0097",  # rand re-entrancy unsoundness; 0.8.6 copy is patched; 0.7.x copy predates rand::rng() and is not affected
