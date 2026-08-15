@@ -583,6 +583,7 @@ fn classify_send_error(err: &InkboxError) -> SendFailure {
         InkboxError::Api {
             status_code,
             detail,
+            ..
         } => {
             let (mut code, message, rule) = match detail {
                 ApiErrorDetail::Structured(v) => (
@@ -981,6 +982,7 @@ mod tests {
         let api = |status: u16, detail: Value| InkboxError::Api {
             status_code: status,
             detail: ApiErrorDetail::Structured(detail),
+            agent_support: None,
         };
         // Content-policy block surfaces the rule inline.
         let f = classify_send_error(&api(

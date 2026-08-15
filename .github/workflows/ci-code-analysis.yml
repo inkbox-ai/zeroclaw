@@ -16,7 +16,7 @@ name: Code Analysis
 
 on:
   pull_request:
-    branches: [master]
+    branches: [master, inkbox]
   push:
     branches: [master]
   schedule:

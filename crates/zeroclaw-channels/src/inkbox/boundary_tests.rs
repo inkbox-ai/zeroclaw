@@ -73,6 +73,10 @@ struct Stack {
 }
 
 async fn start_stack() -> Stack {
+    start_stack_with_capacity(16).await
+}
+
+async fn start_stack_with_capacity(queue_capacity: usize) -> Stack {
     let api = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path(format!("/api/v1/identities/{HANDLE}")))
@@ -91,10 +95,10 @@ async fn start_stack() -> Stack {
     })
     .join()
     .expect("client thread");
-    let channel = InkboxChannel::new(client, HANDLE, KEY, "zc");
+    let channel = InkboxChannel::new(client, HANDLE, KEY, "zc", 180).unwrap();
 
     // The channel's loopback webhook server, exactly as `listen` builds it.
-    let (tx, rx) = mpsc::channel(16);
+    let (tx, rx) = mpsc::channel(queue_capacity);
     channel.failure.set_sender(tx.clone());
     let app = inbound::router(inbound::AppState {
         tx,
@@ -172,6 +176,45 @@ impl Stack {
             .map(|r| serde_json::from_slice(&r.body).unwrap_or(Value::Null))
             .collect()
     }
+}
+
+#[tokio::test]
+async fn queue_backpressure_keeps_a2a_webhook_retryable() {
+    let mut stack = start_stack_with_capacity(1).await;
+    let event = json!({
+        "id": "evt-backpressure",
+        "event_type": "a2a.task.created",
+        "data": {
+            "task_id": "11111111-1111-1111-1111-111111111111",
+            "context_id": "22222222-2222-2222-2222-222222222222",
+            "state": "submitted",
+            "caller": { "handle": "requester" },
+            "message_id": "message-backpressure",
+            "parts": [{"text": "Do the work."}]
+        }
+    });
+    let filler = json!({
+        "event_type": "text.received",
+        "data": { "text_message": {
+            "remote_phone_number": "+15551230000",
+            "text": "fill queue",
+            "id": "filler"
+        }}
+    });
+    assert_eq!(stack.post_signed(&filler).await, 200);
+
+    let request_id = "retryable-a2a-request";
+    let timestamp = super::now_secs() as i64;
+    assert_eq!(
+        stack.post_signed_as(&event, request_id, timestamp).await,
+        503
+    );
+    assert_eq!(stack.recv().await.id, "filler");
+    assert_eq!(
+        stack.post_signed_as(&event, request_id, timestamp).await,
+        200
+    );
+    assert_eq!(stack.recv().await.id, "message-backpressure");
 }
 
 /// The delivery-failure loop end to end: a fresh inbound arrives through the

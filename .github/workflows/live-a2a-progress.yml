@@ -1,0 +1,143 @@
+name: Live A2A Worker Progress
+
+on:
+  pull_request:
+    branches: [inkbox]
+    paths:
+      - ".github/workflows/live-a2a-progress.yml"
+      - "Cargo.lock"
+      - "crates/zeroclaw-api/**"
+      - "crates/zeroclaw-channels/**"
+      - "crates/zeroclaw-config/**"
+      - "tests/live/a2a_progress_*"
+  workflow_dispatch:
+
+concurrency:
+  group: live-a2a-progress-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  inbound-progress:
+    name: Inbound worker progress
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ZEROCLAW_INKBOX_API_KEY: ${{ secrets.ZEROCLAW_INKBOX_API_KEY }}
+      ZEROCLAW_INKBOX_SIGNING_KEY: ${{ secrets.ZEROCLAW_INKBOX_SIGNING_KEY }}
+      REMOTE_INKBOX_API_KEY: ${{ secrets.REMOTE_INKBOX_API_KEY }}
+      INKBOX_BASE_URL: ${{ vars.INKBOX_BASE_URL || 'https://inkbox.ai' }}
+      A2A_TIMEOUT_S: "210"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Check live credentials
+        id: credentials
+        shell: bash
+        run: |
+          if [[ -n "$ZEROCLAW_INKBOX_API_KEY" \
+             && -n "$ZEROCLAW_INKBOX_SIGNING_KEY" \
+             && -n "$REMOTE_INKBOX_API_KEY" ]]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "Live A2A credentials are unavailable; skipping the external scenario."
+          fi
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        if: steps.credentials.outputs.ready == 'true'
+        with:
+          toolchain: 1.96.1
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04bbc2ab54d1c4 # v2.9.1
+        if: steps.credentials.outputs.ready == 'true'
+        with:
+          cache-on-failure: true
+
+      - name: Install live driver
+        if: steps.credentials.outputs.ready == 'true'
+        run: python3 -m pip install "inkbox>=0.5.14,<0.6"
+
+      - name: Build ZeroClaw with Inkbox
+        if: steps.credentials.outputs.ready == 'true'
+        run: cargo build --bin zeroclaw --features channel-inkbox
+
+      - name: Resolve worker identity and write ephemeral config
+        if: steps.credentials.outputs.ready == 'true'
+        shell: bash
+        run: |
+          config_dir="$RUNNER_TEMP/zeroclaw-live-a2a"
+          mkdir -p "$config_dir"
+          ZEROCLAW_LIVE_CONFIG_DIR="$config_dir" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from inkbox import Inkbox
+
+          base_url = os.environ["INKBOX_BASE_URL"].rstrip("/")
+          client = Inkbox(
+              api_key=os.environ["ZEROCLAW_INKBOX_API_KEY"],
+              base_url=base_url,
+          )
+          mailboxes = client.mailboxes.list()
+          if len(mailboxes) != 1:
+              raise RuntimeError("Worker credential must resolve to exactly one mailbox")
+          identity = mailboxes[0].email_address.split("@", 1)[0]
+
+          def toml(value: str) -> str:
+              return json.dumps(value)
+
+          config = f"""
+          schema_version = 3
+
+          [providers.models.custom.live]
+          api_key = "live-mock-key"
+          model = "a2a-progress-model"
+          uri = "http://127.0.0.1:8088/v1"
+          timeout_secs = 240
+
+          [risk_profiles.live]
+          level = "full"
+
+          [agents.worker]
+          model_provider = "custom.live"
+          risk_profile = "live"
+          channels = ["inkbox.live"]
+
+          [channels]
+          message_timeout_secs = 300
+
+          [channels.inkbox.live]
+          enabled = true
+          api_key = {toml(os.environ["ZEROCLAW_INKBOX_API_KEY"])}
+          identity = {toml(identity)}
+          signing_key = {toml(os.environ["ZEROCLAW_INKBOX_SIGNING_KEY"])}
+          base_url = {toml(base_url)}
+          a2a_progress_interval_secs = 60
+          """
+          path = Path(os.environ["ZEROCLAW_LIVE_CONFIG_DIR"]) / "config.toml"
+          path.write_text(config, encoding="utf-8")
+          PY
+          echo "ZEROCLAW_LIVE_CONFIG_DIR=$config_dir" >> "$GITHUB_ENV"
+
+      - name: Run live A2A progress contract
+        if: steps.credentials.outputs.ready == 'true'
+        shell: bash
+        run: |
+          python3 tests/live/a2a_progress_mock.py 8088 > "$RUNNER_TEMP/a2a-model.log" 2>&1 &
+          model_pid=$!
+          target/debug/zeroclaw --config-dir "$ZEROCLAW_LIVE_CONFIG_DIR" channel start \
+            > "$RUNNER_TEMP/a2a-worker.log" 2>&1 &
+          worker_pid=$!
+          cleanup() {
+            kill "$worker_pid" "$model_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          sleep 15
+          python3 tests/live/a2a_progress_driver.py
+
+      - name: Print worker log after failure
+        if: failure() && steps.credentials.outputs.ready == 'true'
+        run: tail -n 300 "$RUNNER_TEMP/a2a-worker.log"

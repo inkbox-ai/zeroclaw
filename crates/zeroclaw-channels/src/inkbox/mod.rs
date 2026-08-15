@@ -13,8 +13,11 @@ use async_trait::async_trait;
 use inkbox::Inkbox;
 use tokio::sync::mpsc;
 use zeroclaw_api::attribution::{Attributable, ChannelKind, Role};
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::channel::{
+    Channel, ChannelMessage, SendMessage, WorkerProgressConfig, WorkerProgressDisposition,
+};
 
+mod a2a;
 #[cfg(test)]
 mod boundary_tests;
 mod delivery_failure;
@@ -48,6 +51,7 @@ enum ReplyRoute<'a> {
     Sms(&'a str),
     SmsTo(&'a str),
     Imessage(&'a str),
+    A2a(&'a str),
     /// Tagged with an unrecognized mode.
     Unknown(&'a str),
 }
@@ -58,6 +62,9 @@ fn reply_route(target: &str) -> ReplyRoute<'_> {
     }
     if let Some(c) = target.strip_prefix("call:") {
         return ReplyRoute::Call(c);
+    }
+    if let Some(task_id) = target.strip_prefix("a2a:") {
+        return ReplyRoute::A2a(task_id);
     }
     let (mode, id) = target.split_once(':').unwrap_or(("sms", target));
     match mode {
@@ -86,6 +93,7 @@ pub struct InkboxChannel {
     /// Delivery-failure retry loop: shared budget between the send path and
     /// the inbound webhook server, so both failure surfaces draw one cap.
     failure: Arc<delivery_failure::FailureTracker>,
+    a2a: a2a::A2aDelivery,
 }
 
 impl InkboxChannel {
@@ -97,15 +105,23 @@ impl InkboxChannel {
         identity: impl Into<String>,
         signing_key: impl Into<String>,
         alias: impl Into<String>,
-    ) -> Self {
+        a2a_progress_interval_secs: u64,
+    ) -> Result<Self> {
         let alias = alias.into();
-        Self {
+        let identity = identity.into();
+        let a2a = a2a::A2aDelivery::new(
+            inkbox.as_ref(),
+            identity.clone(),
+            a2a_progress_interval_secs,
+        )?;
+        Ok(Self {
             inkbox,
-            identity: identity.into(),
+            identity,
             signing_key: signing_key.into(),
             failure: Arc::new(delivery_failure::FailureTracker::new(alias.clone())),
             alias,
-        }
+            a2a,
+        })
     }
 }
 
@@ -211,18 +227,20 @@ fn reconcile_routing(inkbox: &Arc<Inkbox>, handle: &str) -> Result<()> {
             )
             .context("set Inkbox incoming-call webhook + WebSocket URL")?;
     }
+    let mut identity_events = vec![
+        "a2a.task.created",
+        "a2a.task.message",
+        "a2a.task.canceled",
+        "a2a.sent_task.updated",
+    ];
     if identity.imessage_enabled() {
-        ensure(
-            &[
-                "imessage.received",
-                "imessage.delivered",
-                "imessage.delivery_failed",
-            ],
-            None,
-            None,
-            Some(identity.id()),
-        )?;
+        identity_events.extend([
+            "imessage.received",
+            "imessage.delivered",
+            "imessage.delivery_failed",
+        ]);
     }
+    ensure(&identity_events, None, None, Some(identity.id()))?;
     Ok(())
 }
 
@@ -244,6 +262,32 @@ impl Channel for InkboxChannel {
 
     fn typing_refresh_secs(&self) -> u64 {
         INKBOX_TYPING_REFRESH_SECS
+    }
+
+    fn worker_progress(&self, recipient: &str) -> Option<WorkerProgressConfig> {
+        let task_id = recipient.strip_prefix("a2a:")?;
+        Some(WorkerProgressConfig {
+            acknowledgement: self.a2a.acknowledgement(task_id),
+            interval_secs: self.a2a.progress_interval_secs(),
+            elapsed_secs: self.a2a.elapsed_secs(task_id),
+        })
+    }
+
+    async fn send_worker_progress(
+        &self,
+        recipient: &str,
+        text: &str,
+    ) -> Result<WorkerProgressDisposition> {
+        let task_id = recipient
+            .strip_prefix("a2a:")
+            .context("worker progress recipient is not an A2A task")?;
+        self.a2a.reply(task_id, "progress", text).await
+    }
+
+    fn stop_worker_progress(&self, recipient: &str) {
+        if let Some(task_id) = recipient.strip_prefix("a2a:") {
+            self.a2a.stop(task_id);
+        }
     }
 
     /// Show a typing bubble while composing a reply — iMessage only (SMS/email
@@ -308,6 +352,19 @@ impl Channel for InkboxChannel {
                 }
                 return Ok(());
             }
+            ReplyRoute::A2a(task_id) => {
+                // Tool notifications and receipt blocks are not task results.
+                if message.in_reply_to.is_none() && !message.suppress_voice {
+                    return Ok(());
+                }
+                let intent = if message.suppress_voice {
+                    "fail"
+                } else {
+                    "complete"
+                };
+                self.a2a.reply(task_id, intent, &message.content).await?;
+                return Ok(());
+            }
             // Delivery targets fall through to the blocking REST path below.
             _ => {}
         }
@@ -360,7 +417,7 @@ impl Channel for InkboxChannel {
                     anyhow::bail!("unknown Inkbox reply-target mode {mode:?}")
                 }
                 // Non-delivery targets were handled before the blocking hop.
-                ReplyRoute::Noreply | ReplyRoute::Call(_) => {}
+                ReplyRoute::Noreply | ReplyRoute::Call(_) | ReplyRoute::A2a(_) => {}
             }
             Ok(())
         })
@@ -516,7 +573,7 @@ mod tests {
         let inkbox = std::thread::spawn(|| Inkbox::new("ApiKey_test").expect("client builds"))
             .join()
             .expect("client thread");
-        let channel = InkboxChannel::new(inkbox, "ident", "whsec_test", "zc");
+        let channel = InkboxChannel::new(inkbox, "ident", "whsec_test", "zc", 180).unwrap();
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -548,6 +605,10 @@ mod tests {
     fn reply_route_classifies_every_target_shape() {
         assert!(matches!(reply_route("noreply"), ReplyRoute::Noreply));
         assert!(matches!(reply_route("call:c7"), ReplyRoute::Call("c7")));
+        assert!(matches!(
+            reply_route("a2a:task-1"),
+            ReplyRoute::A2a("task-1")
+        ));
         assert!(matches!(
             reply_route("email:a@b.com"),
             ReplyRoute::Email("a@b.com")
@@ -609,12 +670,9 @@ pub(crate) mod test_support {
         })
         .join()
         .expect("client thread");
-        let channel = Arc::new(super::InkboxChannel::new(
-            client,
-            "support-bot",
-            signing_key,
-            alias,
-        ));
+        let channel = Arc::new(
+            super::InkboxChannel::new(client, "support-bot", signing_key, alias, 180).unwrap(),
+        );
         let (tx, rx) = mpsc::channel(16);
         channel.failure.set_sender(tx.clone());
         let app = super::inbound::router(super::inbound::AppState {

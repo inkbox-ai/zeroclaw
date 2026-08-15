@@ -179,6 +179,24 @@ pub struct SendMessage {
     pub force_voice: bool,
 }
 
+/// Periodic status delivery requested by a channel for one active worker turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerProgressConfig {
+    /// Durable message sent before the worker starts model execution.
+    pub acknowledgement: String,
+    /// Seconds between nonterminal updates. A value of zero disables updates.
+    pub interval_secs: u64,
+    /// Elapsed task time carried across task-scoped caller follow-ups.
+    pub elapsed_secs: u64,
+}
+
+/// Outcome of attempting to persist a nonterminal worker update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerProgressDisposition {
+    Sent,
+    AlreadyTerminal,
+}
+
 /// Cross-channel room visibility used by room-management APIs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -468,6 +486,23 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     fn typing_refresh_secs(&self) -> u64 {
         DEFAULT_TYPING_REFRESH_SECS
     }
+
+    /// Opt one inbound recipient into worker acknowledgements and progress.
+    fn worker_progress(&self, _recipient: &str) -> Option<WorkerProgressConfig> {
+        None
+    }
+
+    /// Persist one nonterminal worker update without starting another agent turn.
+    async fn send_worker_progress(
+        &self,
+        _recipient: &str,
+        _text: &str,
+    ) -> anyhow::Result<WorkerProgressDisposition> {
+        Ok(WorkerProgressDisposition::Sent)
+    }
+
+    /// Forget task-scoped worker progress state after an external cancellation.
+    fn stop_worker_progress(&self, _recipient: &str) {}
 
     /// Whether this channel supports progressive message updates via draft edits.
     fn supports_draft_updates(&self) -> bool {

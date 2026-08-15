@@ -13193,6 +13193,10 @@ fn default_inkbox_base_url() -> String {
     "https://inkbox.ai".to_string()
 }
 
+const fn default_inkbox_a2a_progress_interval_secs() -> u64 {
+    180
+}
+
 /// Inkbox channel configuration.
 ///
 /// One instance per agent identity. Inbound email/SMS/iMessage/voice arrive
@@ -13232,6 +13236,11 @@ pub struct InkboxConfig {
     #[quickstart(optional)]
     #[serde(default = "default_inkbox_base_url")]
     pub base_url: String,
+    /// Seconds between nonterminal updates for active inbound A2A tasks.
+    /// Set to `0` to disable periodic updates; pickup acknowledgements remain enabled.
+    #[tab(Behavior)]
+    #[serde(default = "default_inkbox_a2a_progress_interval_secs")]
+    pub a2a_progress_interval_secs: u64,
     /// Tools excluded from this channel's tool spec.
     #[tab(Behavior)]
     #[serde(default)]
@@ -13252,6 +13261,7 @@ impl Default for InkboxConfig {
             identity: String::new(),
             signing_key: String::new(),
             base_url: default_inkbox_base_url(),
+            a2a_progress_interval_secs: default_inkbox_a2a_progress_interval_secs(),
             excluded_tools: Vec::new(),
             reply_min_interval_secs: 0,
             reply_queue_depth_max: 0,
@@ -21857,6 +21867,7 @@ max_height = 8
         // The hand-rolled Default must not drift from the default_inkbox_* helpers.
         let d = InkboxConfig::default();
         assert_eq!(d.base_url, default_inkbox_base_url());
+        assert_eq!(d.a2a_progress_interval_secs, 180);
         assert!(!d.enabled);
 
         // A minimal block fills required fields and serde-defaults the rest.
@@ -21869,6 +21880,17 @@ max_height = 8
         .expect("inkbox config deserializes");
         assert_eq!(cfg.identity, "zero-claw-inkbox");
         assert_eq!(cfg.base_url, "https://inkbox.ai");
+        assert_eq!(cfg.a2a_progress_interval_secs, 180);
+
+        let configured: InkboxConfig = toml::from_str(
+            r#"
+            api_key = "ApiKey_x"
+            identity = "zero-claw-inkbox"
+            a2a_progress_interval_secs = 60
+            "#,
+        )
+        .expect("Inkbox A2A progress interval deserializes");
+        assert_eq!(configured.a2a_progress_interval_secs, 60);
     }
 
     #[test]

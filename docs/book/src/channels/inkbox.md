@@ -53,6 +53,7 @@ defaults pre-filled):
 | `identity` | yes | the agent handle this gateway runs as |
 | `signing_key` | no (secret) | webhook signing key (`whsec_...`) for inbound verification |
 | `base_url` | no | defaults to `https://inkbox.ai` |
+| `a2a_progress_interval_secs` | no | periodic A2A worker update interval; defaults to 180 seconds |
 
 Creating the identity, provisioning a phone number, minting a signing key, and
 enabling iMessage happen in the Inkbox console, not the CLI.
@@ -90,6 +91,20 @@ budget that resets on a fresh inbound message, a delivered receipt, or after
 30 minutes, and webhook replays deduped per failed message. When there is
 nothing sensible to resend, the agent replies `[SILENT]` and nothing is
 delivered to the recipient.
+
+## A2A worker progress
+
+When this identity receives an A2A task, the channel immediately records a
+pickup acknowledgement in the task history. While the task remains active, it
+adds a short progress update every three minutes by default. Set
+`a2a_progress_interval_secs` on the channel instance to choose another cadence,
+or set it to `0` to keep the acknowledgement and disable periodic updates.
+
+Progress summaries use only sanitized coarse activity categories;
+raw tool arguments and results are never retained for the summary. Progress is
+nonterminal, does not start a requester model turn, and stops before the task is
+completed, failed, or canceled. Caller follow-ups preserve the task's original
+elapsed-time baseline.
 
 ## Voice calls
 

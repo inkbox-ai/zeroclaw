@@ -108,6 +108,12 @@ pub(super) fn verify_signed_request(
     SignedRequest::Fresh
 }
 
+fn forget_signed_request(header_map: &HashMap<String, String>, dedup: &RequestDedup) {
+    if let Some(request_id) = header_map.get("x-inkbox-request-id") {
+        dedup.lock().remove(request_id);
+    }
+}
+
 /// Build the loopback router: the call-media WebSocket on its fixed path, and
 /// a catch-all fallback that treats every other request as a webhook (the
 /// tunnel preserves whatever path Inkbox's subscription posts to).
@@ -252,16 +258,17 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: Bytes)
         state
             .failure
             .remember_sender(&msg.reply_target, &msg.sender);
-        // A full inbound queue must not wedge the tunnel, so we drop on
-        // backpressure — but a silently lost inbound message is exactly the kind
-        // of failure worth seeing, so log it.
+        // Backpressure is retryable. Remove the request id from replay protection
+        // so Inkbox can redeliver this exact signed event after the queue drains.
         if let Err(e) = state.tx.try_send(msg) {
+            forget_signed_request(&header_map, &state.request_dedup);
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                format!("[inkbox] dropped inbound message on backpressure: {e}"),
+                format!("[inkbox] rejected inbound message on backpressure: {e}"),
             );
+            return StatusCode::SERVICE_UNAVAILABLE;
         }
     }
     StatusCode::OK
@@ -319,6 +326,16 @@ fn with_party_marker(label: &str, addr: &str, contact_id: Option<&str>, body: &s
         (false, _) => format!("[from {addr}]"),
     };
     format!("{header}\n{body}")
+}
+
+fn a2a_parts_text(parts: Option<&Value>) -> String {
+    parts
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Map an Inkbox webhook payload to a [`ChannelMessage`]. Returns `None` for
@@ -435,6 +452,100 @@ fn map_event(payload: &Value, alias: &str) -> Option<ChannelMessage> {
                 ts,
             )))
         }
+        Some("a2a.task.created" | "a2a.task.message") => {
+            let data = payload.get("data")?;
+            let task_id = data.get("task_id").and_then(Value::as_str)?;
+            uuid::Uuid::parse_str(task_id).ok()?;
+            let text = a2a_parts_text(data.get("parts"));
+            if text.trim().is_empty() {
+                return None;
+            }
+            let caller = data.get("caller")?;
+            let sender = caller
+                .get("handle")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .or_else(|| caller.get("identity_id").and_then(Value::as_str))?
+                .trim_start_matches('@')
+                .to_string();
+            let message_id = data
+                .get("message_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .or_else(|| payload.get("id").and_then(Value::as_str))
+                .unwrap_or(task_id)
+                .to_string();
+            let content = format!("[A2A task from @{sender}]\n{text}");
+            let mut message = ChannelMessage::new(
+                message_id,
+                sender,
+                format!("a2a:{task_id}"),
+                content,
+                "inkbox",
+                ts,
+            );
+            message.interruption_scope_id = Some(task_id.to_string());
+            Some(with_alias(message))
+        }
+        Some("a2a.task.canceled") => {
+            let data = payload.get("data")?;
+            let task_id = data.get("task_id").and_then(Value::as_str)?;
+            uuid::Uuid::parse_str(task_id).ok()?;
+            let caller = data.get("caller")?;
+            let sender = caller
+                .get("handle")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .or_else(|| caller.get("identity_id").and_then(Value::as_str))?
+                .trim_start_matches('@')
+                .to_string();
+            let mut message = ChannelMessage::new(
+                payload.get("id").and_then(Value::as_str).unwrap_or(task_id),
+                sender,
+                format!("a2a:{task_id}"),
+                "The caller canceled this task.",
+                "inkbox",
+                ts,
+            );
+            message.interruption_scope_id = Some(task_id.to_string());
+            message.passive_context = true;
+            Some(with_alias(message))
+        }
+        Some("a2a.sent_task.updated") => {
+            let data = payload.get("data")?;
+            let task_id = data.get("task_id").and_then(Value::as_str)?;
+            uuid::Uuid::parse_str(task_id).ok()?;
+            let state = data.get("state").and_then(Value::as_str).unwrap_or("");
+            let normalized_state = state.to_ascii_lowercase();
+            // Progress is already durable in the A2A task history. It is a
+            // human-facing status signal, not a new requester instruction.
+            if matches!(
+                normalized_state.as_str(),
+                "submitted" | "queued" | "working" | "running"
+            ) {
+                return None;
+            }
+            let text = a2a_parts_text(data.get("parts"));
+            let content = if text.trim().is_empty() {
+                format!("Outbound A2A task {task_id} changed to {state}.")
+            } else {
+                format!("Outbound A2A task {task_id} changed to {state}.\n{text}")
+            };
+            let mut message = ChannelMessage::new(
+                data.get("message_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| payload.get("id").and_then(Value::as_str))
+                    .unwrap_or(task_id),
+                "a2a-worker",
+                "noreply",
+                content,
+                "inkbox",
+                ts,
+            );
+            message.interruption_scope_id = Some(task_id.to_string());
+            Some(with_alias(message))
+        }
         _ => None,
     }
 }
@@ -507,6 +618,92 @@ mod tests {
             map_event(&payload, "zc").unwrap().reply_target,
             "imessage:ic-2"
         );
+    }
+
+    #[test]
+    fn a2a_task_maps_to_isolated_worker_turn() {
+        let task_id = "11111111-1111-1111-1111-111111111111";
+        let payload = json!({
+            "id": "evt-1",
+            "event_type": "a2a.task.created",
+            "data": {
+                "task_id": task_id,
+                "context_id": "22222222-2222-2222-2222-222222222222",
+                "state": "submitted",
+                "caller": {
+                    "identity_id": "33333333-3333-3333-3333-333333333333",
+                    "organization_id": "org-example",
+                    "handle": "requester"
+                },
+                "message_id": "message-1",
+                "parts": [{"text": "Add the two values."}]
+            }
+        });
+        let message = map_event(&payload, "zc").expect("A2A task maps");
+        assert_eq!(message.id, "message-1");
+        assert_eq!(message.sender, "requester");
+        assert_eq!(message.reply_target, format!("a2a:{task_id}"));
+        assert_eq!(message.interruption_scope_id.as_deref(), Some(task_id));
+        assert_eq!(message.channel_alias.as_deref(), Some("zc"));
+        assert!(message.content.ends_with("Add the two values."));
+    }
+
+    #[test]
+    fn a2a_cancel_is_passive_and_keeps_the_task_scope() {
+        let task_id = "11111111-1111-1111-1111-111111111111";
+        let payload = json!({
+            "id": "evt-cancel",
+            "event_type": "a2a.task.canceled",
+            "data": {
+                "task_id": task_id,
+                "context_id": "22222222-2222-2222-2222-222222222222",
+                "state": "canceled",
+                "caller": {
+                    "identity_id": "33333333-3333-3333-3333-333333333333",
+                    "organization_id": "org-example",
+                    "handle": "requester"
+                }
+            }
+        });
+        let message = map_event(&payload, "zc").expect("A2A cancellation maps");
+        assert!(message.passive_context);
+        assert_eq!(message.interruption_scope_id.as_deref(), Some(task_id));
+        assert_eq!(message.reply_target, format!("a2a:{task_id}"));
+    }
+
+    #[test]
+    fn sent_task_progress_does_not_wake_but_terminal_update_remains_actionable() {
+        let task_id = "11111111-1111-1111-1111-111111111111";
+        let progress = json!({
+            "id": "evt-progress",
+            "event_type": "a2a.sent_task.updated",
+            "data": {
+                "task_id": task_id,
+                "context_id": "22222222-2222-2222-2222-222222222222",
+                "state": "working",
+                "caller": {"identity_id": "caller", "organization_id": "org"},
+                "message_id": "message-progress",
+                "parts": [{"text": "Still checking the requested records."}]
+            }
+        });
+        assert!(map_event(&progress, "zc").is_none());
+
+        let completed = json!({
+            "id": "evt-completed",
+            "event_type": "a2a.sent_task.updated",
+            "data": {
+                "task_id": task_id,
+                "context_id": "22222222-2222-2222-2222-222222222222",
+                "state": "completed",
+                "caller": {"identity_id": "caller", "organization_id": "org"},
+                "message_id": "message-completed",
+                "parts": [{"text": "The requested work is ready."}]
+            }
+        });
+        let message = map_event(&completed, "zc").expect("terminal update maps");
+        assert_eq!(message.reply_target, "noreply");
+        assert_eq!(message.interruption_scope_id.as_deref(), Some(task_id));
+        assert!(message.content.contains("completed"));
     }
 
     #[test]

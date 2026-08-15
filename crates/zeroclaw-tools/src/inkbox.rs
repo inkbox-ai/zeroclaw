@@ -699,6 +699,7 @@ impl Tool for InkboxListContacts {
         let params = ListContactsParams {
             q: str_arg(&args, "q"),
             order: None,
+            review_status: Vec::new(),
             limit: Some(int_arg(&args, "limit", 25)),
             offset: Some(int_arg(&args, "offset", 0)),
         };
